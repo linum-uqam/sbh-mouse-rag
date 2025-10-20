@@ -1,0 +1,20 @@
+# pyproject.toml
+[project]
+name = "sbh-mouse-rag"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+  "numpy", "scipy", "pandas", "tqdm", "pillow", "requests", "pyyaml", "python-dotenv",
+  "torch", "torchvision", "torchaudio",
+  "transformers", "tokenizers", "accelerate", "sentence-transformers", "huggingface-hub", "safetensors", "timm",
+  "faiss-cpu",
+  "opencv-python", "scikit-image", "imageio", "tifffile",
+  "monai", "simpleitk", "nibabel", "allensdk>=2.16",
+  "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings",
+  "SQLAlchemy", "psycopg2-binary",
+  "mlflow", "optuna",
+  "scikit-learn"
+]
+
+[tool.uv]
+python-preference = "managed"   # uv will auto-manage/download a matching Python
