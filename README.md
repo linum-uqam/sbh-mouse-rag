@@ -14,5 +14,13 @@ python -m volume.usage
 ```
 
 ## Dataset
+```bash
+python -m dataset.create_dataset
+```
+
+## Index
+```bash
+python -m index.create
+```
 
 

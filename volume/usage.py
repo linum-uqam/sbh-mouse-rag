@@ -1,34 +1,23 @@
-# volume/usage.py
 from pathlib import Path
-from volume.volume_helper import AllenVolume, NiftiVolume, slice_distance
+from volume.volume_helper import AllenVolume, NiftiVolume, AnnotationHelper, Slice
 
-def main():
-    out = Path("volume/out")
-    out.mkdir(parents=True, exist_ok=True)
+out_dir = Path("volume/out"); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Allen template
-    allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=25)
-    print("Allen dims (Z,Y,X):", allen.get_dimension())
-    a_slice = allen.get_slice((0,0,1), depth=0.0, rotation=25.0, size=512)
-    a_slice.save(out / "allen_slice.png", title="Allen template slice")
+# 1) Allen slice with labels only
+allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=25)
+s_allen = allen.get_slice((0,0,1), depth=0.0, rotation=25.0, size=512, include_annotation=True)
+s_allen.save(out_dir / "allen_labels.png", overlay="labels", title="Allen labels")
+s_allen.save(out_dir / "allen_overlay.png", overlay="image+labels", title="Allen image+labels")
 
-    # 2) Your NIfTI volume
-    real = NiftiVolume("volume/data/real/real_mouse_brain_ras_25um.nii.gz")
-    print("Real dims (Z,Y,X):", real.get_dimension())
-    r_slice = real.get_slice((0,0,1), depth=0.0, rotation=25.0, size=512)
-    r_slice.save(out / "real_slice.png", title="Real volume slice")
+# 2) Real volume with Allen annotation overlay (assumes aligned to Allen space)
+real = NiftiVolume("volume/data/real/real_mouse_brain_ras_25um.nii.gz")
+annot = AnnotationHelper(cache_dir="volume/data/allen", resolution_um=25)
+s_real = real.get_slice((0,0,1), depth=0.0, rotation=25.0, size=512, include_annotation=True, annotation_helper=annot)
+s_real.save(out_dir / "real_overlay.png", overlay="image+labels", title="Real + Allen labels")
 
-    c_norm = r_slice.crop_norm(cx=0.25, cy=0.75, rw=0.4, rh=0.4)
-    c_norm.save(out / "crop_norm.png")
+# 3) Cropped slice keeps labels
+c = s_real.crop_norm(cx=0.25, cy=0.75, rw=0.4, rh=0.4)
+c.save(out_dir / "real_overlay_cropped.png", overlay="image+labels", title="Crop with labels")
 
-    # Distances — now based on slices
-    print("Allen–Allen (same):", slice_distance(a_slice, a_slice))
-    print("Allen–Real (same pose):", slice_distance(a_slice, r_slice))
-
-    # Different pose examples
-    s1 = allen.get_slice((1,0,0), depth=20.0, size=512)
-    s2 = allen.get_slice((0,1,0), depth=20.0, size=512)
-    print("Orthogonal @ same depth:", slice_distance(s1, s2))
-
-if __name__ == "__main__":
-    main()
+# 4) Distance still works (independent of labels)
+print("distance:", Slice.distance(s_allen, s_real))
