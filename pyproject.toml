@@ -1,14 +1,15 @@
-# pyproject.toml
 [project]
 name = "sbh-mouse-rag"
 version = "0.0.0"
 requires-python = "==3.11.*"
 dependencies = [
-  "numpy<2", "scipy", "pandas", "tqdm", "pillow", "requests", "pyyaml", "python-dotenv", "opencv-python",
+  "numpy<1.24",
+  "scipy<1.11",
+  "pandas", "tqdm", "pillow", "requests", "pyyaml", "python-dotenv", "opencv-python",
   "torch", "torchvision", "torchaudio",
   "transformers", "tokenizers", "accelerate", "sentence-transformers", "huggingface-hub", "safetensors", "timm",
-  "faiss-gpu-cu12",
-  "opencv-python", "scikit-image", "imageio", "tifffile",
+  "faiss-cpu",
+  "scikit-image", "imageio", "tifffile",
   "monai", "simpleitk", "nibabel", "allensdk>=2.16",
   "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings",
   "SQLAlchemy", "psycopg2-binary",

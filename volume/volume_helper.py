@@ -46,7 +46,7 @@ class Slice:
         ax = fig.add_subplot(111)
 
         if overlay == "image":
-            ax.imshow(self.image, cmap="gray", vmin=0, vmax=1)
+            ax.imshow(self.image, cmap="gray")
         elif overlay == "labels":
             if self.labels is None:
                 raise ValueError("No labels in this slice to save as 'labels'.")
@@ -116,6 +116,40 @@ class Slice:
             size_px=min(img_sub.shape[0], img_sub.shape[1]),
             volume_shape_zyx=self.volume_shape_zyx,
             labels=labels_sub,
+        )
+    
+    def normalized(
+        self,
+        lo: float | None = None,
+        hi: float | None = None,
+        *,
+        percentiles: tuple[float, float] = (0.5, 99.5),
+    ) -> "Slice":
+        """
+        Return a NEW Slice with image normalized to [0,1].
+
+        - If lo/hi are provided, use them (e.g., volume-level global bounds).
+        - Otherwise, compute robust per-slice bounds from `percentiles`.
+        """
+        img = self.image.astype(np.float32, copy=False)
+
+        if lo is None or hi is None:
+            lo_p, hi_p = np.percentile(img, percentiles)
+            lo = float(lo_p)
+            hi = float(hi_p)
+
+        scale = (hi - lo) if (hi - lo) > 1e-12 else 1.0
+        img01 = np.clip((img - lo) / scale, 0.0, 1.0).astype(np.float32)
+
+        return Slice(
+            image=img01,
+            normal_xyz_unit=self.normal_xyz_unit,
+            depth_vox=self.depth_vox,
+            rotation_deg=self.rotation_deg,
+            pixel_step_vox=self.pixel_step_vox,
+            size_px=self.size_px,
+            volume_shape_zyx=self.volume_shape_zyx,
+            labels=(None if self.labels is None else self.labels.copy()),
         )
 
     # ---------- Distance (class utility) ----------
@@ -200,12 +234,33 @@ class VolumeHelper:
     """
     def __init__(self):
         self._vol: Optional[_Vol] = None
+        self._global_lo_hi: Optional[Tuple[float, float]] = None
 
     def _set_volume(self, arr_zyx: np.ndarray, spacing_zyx: Tuple[float,float,float] = (1.0,1.0,1.0)):
         if arr_zyx.ndim != 3:
             raise ValueError("Volume must be 3D")
         self._vol = _Vol(arr=arr_zyx, spacing=spacing_zyx)
+        lo, hi = np.percentile(arr_zyx, [0.5, 99.5])
+        self._global_lo_hi = (float(lo), float(hi))
 
+    def is_valid_slice(
+        self,
+        sl: Slice,
+        *,
+        ratio_threshold: float = 0.10,       # % of pixels that must be above threshold
+        value_threshold_pct: float = 0.10,   # threshold = lo + pct*(hi-lo)
+        use_global_bounds: bool = True,
+    ) -> bool:
+        if use_global_bounds and self._global_lo_hi is not None:
+            lo, hi = self._global_lo_hi
+        else:
+            lo = float(np.min(sl.image))
+            hi = float(np.max(sl.image))
+
+        thr = lo + value_threshold_pct * (hi - lo)
+        mask = sl.image > thr
+        return (mask.sum() / sl.image.size) > ratio_threshold
+    
     # ---------- tiny internals now in the class ----------
     @staticmethod
     def _unit(v: np.ndarray) -> np.ndarray:
@@ -249,6 +304,9 @@ class VolumeHelper:
     # --------------- public API ---------------
     def get_dimension(self) -> Tuple[int, int, int]:
         return tuple(self._vol.arr.shape)  # (Z,Y,X)
+    
+    def get_global_intensity_bounds(self) -> Tuple[float, float]:
+        return self._global_lo_hi
 
     def get_slice(
         self,
@@ -275,11 +333,6 @@ class VolumeHelper:
 
         order = 1 if linear_interp and np.issubdtype(V.dtype, np.floating) else 0
         img = map_coordinates(V, coords, order=order, mode="nearest").astype(np.float32)
-
-        # Normalize grayscale if float volume
-        if np.issubdtype(V.dtype, np.floating):
-            lo, hi = np.percentile(img, [0.5, 99.5])
-            img = np.clip((img - lo) / (hi - lo + 1e-12), 0, 1)
 
         labels = None
         if include_annotation:
