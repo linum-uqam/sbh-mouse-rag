@@ -27,16 +27,17 @@ python -m index.create
 
 **With a whole slice**
 ```bash
-python -m index.search dataset/data/67_a_slice.png --mode col --angles 0 90 180 270 --scales 1 2 4 8 14 --base-topk-for-col 400
+python -m index.search dataset/data/13_a_slice.png --mode col --debug --save-dir index/out/ 
 ```
 
 **With a crop slice**
 ```bash
-python -m index.search index/test/test.PNG --mode col --angles 0 90 180 270 --scales 1 2 4 8 14 --base-topk-for-col 400
+python -m index.search index/test/test.PNG --mode col --debug --save-dir index/out/ 
 ```
 
 ## Eval
 ```bash
-todo
+python -m eval.run
 ```
+
 

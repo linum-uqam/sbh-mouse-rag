@@ -1,9 +1,7 @@
-# index/create.py
 from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Dict
-import multiprocessing as mp
 
 import faiss
 import numpy as np
@@ -11,21 +9,33 @@ from tqdm.auto import tqdm
 
 from volume.volume_helper import AllenVolume
 from index.geom import iter_slices_fibonacci, count_slices_fibonacci
-from index.utils import make_slice_id, image_to_token_mask
-from index.store import build_flat_ip, build_hnsw_ip, write_manifest_slice, wrap_with_ids
+from index.utils import make_slice_id, image_to_token_mask, log
+from index.store import write_manifest_slice, IndexStore
+from index.builder import (
+    build_base_index, adaptive_pool_tokens_to_vec,
+    create_ivfpq,
+)
 from index.model.dino import model
-from .config import OUT_DIR, TOK_DIR, K_NORMALS, SLICE_SIZE, USE_HNSW, D, HNSW_M, HNSW_EF_CONSTRUCTION
+from .config import (
+    OUT_DIR, TOK_DIR, K_NORMALS, SLICE_SIZE, D,
+    USE_HNSW, HNSW_M, HNSW_EF_CONSTRUCTION,
+    SLICE_SCALES,
+    TOKEN_INDEX_PATH,
+)
+
+
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     TOK_DIR.mkdir(parents=True, exist_ok=True)
 
     allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=25)
-
     total_slices = count_slices_fibonacci(allen, k_normals=K_NORMALS)
 
-    # Build FAISS coarse (global) index only
-    coarse = wrap_with_ids(build_hnsw_ip(D) if USE_HNSW else build_flat_ip(D))
+    # ---- Global (1x1) index and mandatory per-scale indexes ----
+    coarse = build_base_index(D, USE_HNSW, HNSW_M, HNSW_EF_CONSTRUCTION)
+    coarse_by_scale: Dict[int, faiss.Index] = {k: build_base_index(D, USE_HNSW, HNSW_M, HNSW_EF_CONSTRUCTION)
+                                               for k in SLICE_SCALES}
 
     slice_rows: List[Dict] = []
 
@@ -38,7 +48,6 @@ def main() -> None:
     )
 
     bar = tqdm(it, total=total_slices, desc="Indexing slices", unit="slice", dynamic_ncols=True)
-    
     for slc, meta in bar:
         bar.set_postfix(normal=meta["normal_idx"], depth=meta["depth_idx"])
         sid = make_slice_id(meta["normal_idx"], meta["depth_idx"], meta["rot_idx"])
@@ -49,29 +58,37 @@ def main() -> None:
 
         # Embeddings (global + tokens)
         out = model.embed_both(slc_n.image)
-        g = out["global"].astype(np.float32)
-        t = out["tokens"].astype(np.float32)      # (T,D)
+        g = out["global"].astype(np.float32)     # (D,)
+        t = out["tokens"].astype(np.float32)     # (T,D)
         grid_hw = int(np.sqrt(t.shape[0]))
 
-        # --- NEW: candidate-side patch mask (True=foreground) ---
-        fg_hw = image_to_token_mask(slc_n.image, grid_hw=grid_hw, bg_threshold=0.02)  # tune 0.01-0.05 if needed
-        mask_flat = fg_hw.reshape(-1).astype(np.uint8)  # compact
+        # Candidate-side patch mask (True=foreground)
+        fg_hw = image_to_token_mask(slc_n.image, grid_hw=grid_hw, bg_threshold=0.02)
+        mask_flat = fg_hw.reshape(-1).astype(np.uint8)
 
-        # Normalize global and add to coarse index
-        faiss.normalize_L2(g.reshape(1, -1))
-        coarse.add_with_ids(g.reshape(1, -1), np.array([sid], dtype=np.int64))
+        # ---- add to global index ----
+        g1 = g.reshape(1, -1)
+        faiss.normalize_L2(g1)
+        coarse.add_with_ids(g1, np.array([sid], dtype=np.int64))
 
-        # Persist token matrix (float16) + mask (uint8)
+        # ---- add to per-scale indexes (pooled vectors) ----
+        # pool tokens -> one (D,) vector per k, normalize, add with same sid
+        for k in SLICE_SCALES:
+            vk = adaptive_pool_tokens_to_vec(t, grid_hw, k).reshape(1, -1)
+            faiss.normalize_L2(vk)
+            coarse_by_scale[k].add_with_ids(vk, np.array([sid], dtype=np.int64))
+
+        # ---- persist tokens (float16) + mask (uint8) ----
         tok_path  = TOK_DIR / f"n{meta['normal_idx']}_d{meta['depth_idx']}_r{meta['rot_idx']}.fp16.npy"
         mask_path = TOK_DIR / f"n{meta['normal_idx']}_d{meta['depth_idx']}_r{meta['rot_idx']}.mask.npy"
         np.save(tok_path,  t.astype(np.float16))
         np.save(mask_path, mask_flat)
 
-        # Slice manifest row
+        # ---- manifest row ----
         slice_rows.append({
             "id": sid,
             "token_path": str(tok_path),
-            "mask_path":  str(mask_path),     # <-- NEW
+            "mask_path":  str(mask_path),
 
             # pose
             "normal_idx": meta["normal_idx"], "depth_idx": meta["depth_idx"], "rot_idx": meta["rot_idx"],
@@ -86,16 +103,30 @@ def main() -> None:
             "linear_interp": True,
         })
 
-        # Persist incremental artifacts for crash-safety
-        faiss.write_index(coarse, str(OUT_DIR / "coarse.faiss"))
+        # ---- crash-safe incremental persist ----
+        IndexStore.save_faiss(coarse, OUT_DIR / "coarse.faiss")
+        for k, idx in coarse_by_scale.items():
+            IndexStore.save_faiss(idx, OUT_DIR / f"coarse.scale{k}.faiss")
         write_manifest_slice(slice_rows, OUT_DIR / "manifest.parquet")
 
-    print("Done.")
-    print(f" - Slices:  {len(slice_rows)}")
-    print(f" - Saved:   {OUT_DIR/'coarse.faiss'}")
-    print(f" - Manifest:{OUT_DIR/'manifest.parquet'}")
+    # after building & saving coarse + manifest:
+    log("slices", [
+        f"Slices        : {len(slice_rows)}",
+        f"Global index  : {OUT_DIR/'coarse.faiss'}",
+        "Scale indexes : " + ", ".join(str(OUT_DIR / f'coarse.scale{k}.faiss') for k in SLICE_SCALES),
+        f"Manifest      : {OUT_DIR/'manifest.parquet'}",
+    ])
+
+    # phase-2:
+    log("tokens", ["Phase-2 build (IVF-PQ) starting..."])
+    create_ivfpq(
+        manifest_path=OUT_DIR / "manifest.parquet",
+        out_path=TOKEN_INDEX_PATH,
+    )
+    log("tokens", [f"IVF-PQ index  : {TOKEN_INDEX_PATH}"])
 
 
 if __name__ == "__main__":
+    import multiprocessing as mp
     faiss.omp_set_num_threads(max(1, mp.cpu_count() - 1))
     main()

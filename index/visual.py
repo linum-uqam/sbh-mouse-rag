@@ -217,21 +217,29 @@ def _draw_grid(img: Image.Image, grid_h: int, grid_w: int, color: Tuple[int, int
 
 
 def _draw_topk_boxes(img: Image.Image, norm_heat: np.ndarray, topk: int, color: Tuple[int, int, int]) -> None:
-    """Draw top-K hottest cell rectangles."""
+    """Draw top-K hottest cell rectangles (ignore zero-heat/background cells)."""
     W, H = img.size
     grid_h, grid_w = norm_heat.shape
     cell_w = W / grid_w
     cell_h = H / grid_h
+
     flat = norm_heat.reshape(-1)
-    if flat.size == 0:
+    if flat.size == 0 or topk <= 0:
         return
-    k = min(int(topk), flat.size)
-    idx = np.argpartition(-flat, k - 1)[:k]
+
+    eps = 1e-6
+    pos_idx = np.flatnonzero(flat > eps)
+    if pos_idx.size == 0:
+        return
+
+    k = min(int(topk), int(pos_idx.size))
+    # argpartition within the positive set
+    top_local = np.argpartition(-flat[pos_idx], k - 1)[:k]
+    idx = pos_idx[top_local]
+
     yy, xx = np.unravel_index(idx, (grid_h, grid_w))
     draw = ImageDraw.Draw(img)
     for i, j in zip(yy.tolist(), xx.tolist()):
-        x0 = int(round(j * cell_w))
-        y0 = int(round(i * cell_h))
-        x1 = int(round((j + 1) * cell_w))
-        y1 = int(round((i + 1) * cell_h))
+        x0 = int(round(j * cell_w)); x1 = int(round((j + 1) * cell_w))
+        y0 = int(round(i * cell_h)); y1 = int(round((i + 1) * cell_h))
         draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
