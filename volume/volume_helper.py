@@ -11,6 +11,9 @@ from allensdk.core.reference_space_cache import ReferenceSpaceCache  # AllenVolu
 import nibabel as nib  # NiftiVolume
 import matplotlib.pyplot as plt
 
+def _compute_lo_hi(arr: np.ndarray, percentiles=(0.5, 99.5)) -> tuple[float, float]:
+    lo, hi = np.percentile(arr, percentiles)
+    return float(lo), float(hi)
 
 # -------------------- Slice object --------------------
 
@@ -120,25 +123,16 @@ class Slice:
     
     def normalized(
         self,
-        lo: float | None = None,
-        hi: float | None = None,
         *,
         percentiles: tuple[float, float] = (0.5, 99.5),
     ) -> "Slice":
         """
         Return a NEW Slice with image normalized to [0,1].
-
-        - If lo/hi are provided, use them (e.g., volume-level global bounds).
-        - Otherwise, compute robust per-slice bounds from `percentiles`.
+        - Always clips to [0,1].
         """
         img = self.image.astype(np.float32, copy=False)
-
-        if lo is None or hi is None:
-            lo_p, hi_p = np.percentile(img, percentiles)
-            lo = float(lo_p)
-            hi = float(hi_p)
-
-        scale = (hi - lo) if (hi - lo) > 1e-12 else 1.0
+        lo, hi = np.percentile(img, percentiles)
+        scale = max(hi - lo, 1e-12)                     # guard zero/neg span
         img01 = np.clip((img - lo) / scale, 0.0, 1.0).astype(np.float32)
 
         return Slice(
@@ -234,30 +228,31 @@ class VolumeHelper:
     """
     def __init__(self):
         self._vol: Optional[_Vol] = None
-        self._global_lo_hi: Optional[Tuple[float, float]] = None
+        self._global_lo: Optional[float] = None   # was _global_lo_hi
+        self._global_hi: Optional[float] = None   # was _global_lo_hi
+        self._is_normalized: bool = False
 
     def _set_volume(self, arr_zyx: np.ndarray, spacing_zyx: Tuple[float,float,float] = (1.0,1.0,1.0)):
         if arr_zyx.ndim != 3:
             raise ValueError("Volume must be 3D")
         self._vol = _Vol(arr=arr_zyx, spacing=spacing_zyx)
-        lo, hi = np.percentile(arr_zyx, [0.5, 99.5])
-        self._global_lo_hi = (float(lo), float(hi))
+        lo, hi = _compute_lo_hi(arr_zyx, percentiles=(0.5, 99.5))
+        self._global_lo, self._global_hi = float(lo), float(hi)
+        self._is_normalized = False
 
+    
     def is_valid_slice(
         self,
         sl: Slice,
         *,
-        ratio_threshold: float = 0.10,       # % of pixels that must be above threshold
+        ratio_threshold: float = 0.10, 
+        percentiles: tuple[float, float] = (0.5, 99.5),
         value_threshold_pct: float = 0.10,   # threshold = lo + pct*(hi-lo)
-        use_global_bounds: bool = True,
     ) -> bool:
-        if use_global_bounds and self._global_lo_hi is not None:
-            lo, hi = self._global_lo_hi
-        else:
-            lo = float(np.min(sl.image))
-            hi = float(np.max(sl.image))
+        if not self._global_lo:
+            self._global_lo, self._global_hi = np.percentile(sl.image, percentiles)
 
-        thr = lo + value_threshold_pct * (hi - lo)
+        thr = self._global_lo + value_threshold_pct * (self._global_hi - self._global_lo)
         mask = sl.image > thr
         return (mask.sum() / sl.image.size) > ratio_threshold
     
@@ -305,8 +300,30 @@ class VolumeHelper:
     def get_dimension(self) -> Tuple[int, int, int]:
         return tuple(self._vol.arr.shape)  # (Z,Y,X)
     
+    def normalize_volume(
+        self,
+        *,
+        percentiles: tuple[float, float] = (0.5, 99.5),
+    ) -> None:
+        arr = self._vol.arr.astype(np.float32, copy=False)
+
+        lo, hi = np.percentile(arr, percentiles)
+        scale = max(hi - lo, 1e-12)  # epsilon guard
+
+        arr01 = (arr - float(lo)) / float(scale)
+        np.clip(arr01, 0.0, 1.0, out=arr01)
+
+        # write back and mark normalized
+        self._vol = _Vol(arr=arr01.astype(np.float32, copy=False), spacing=self._vol.spacing)
+        self._global_lo, self._global_hi = 0.0, 1.0
+        self._is_normalized = True
+
+    def is_normalized(self) -> bool:
+        """Return True if the volume has been normalized to [0,1]."""
+        return bool(self._is_normalized)
+    
     def get_global_intensity_bounds(self) -> Tuple[float, float]:
-        return self._global_lo_hi
+        return (self._global_lo, self._global_hi)
 
     def get_slice(
         self,

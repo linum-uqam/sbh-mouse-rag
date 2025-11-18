@@ -74,6 +74,7 @@ class SliceSearcher:
         q_vars = model.embed_query_augmentations(
             img_np, angles=params["angles"], scales=params["scales"]
         )
+        print(f"[search] \n  number of search after query augmentation {len(params['angles'])*len(params['scales'])}")  
 
         # 2) Stage-1 (hybrid) coarse shortlist
         agg_g = self._coarse_global(q_vars, per_rot=params["base_per_rotation"])

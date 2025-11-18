@@ -37,7 +37,14 @@ python -m index.search index/test/test.PNG --mode col --debug --save-dir index/o
 
 ## Eval
 ```bash
-python -m eval.run
+python -m eval.run \
+  --mode col \
+  --save-dir eval/out \
+  --final-k 10 \
+  --limit 50
+  --scales 1 8 14
+  --token-scales 8 14
+
 ```
 
 
