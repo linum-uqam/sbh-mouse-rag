@@ -15,36 +15,35 @@ python -m volume.usage
 
 ## Dataset
 ```bash
-python -m dataset.create
+python -m scripts.create_dataset
 ```
 
 ## Index
 ```bash
-python -m index.create
+python -m scripts.create_index
+python -m scripts.create_index --k-normals 16 --slice-size 512 --patch-scales 1 2 4 8 --patch-overlap 0.5
 ```
 
 ## Search
 
 **With a whole slice**
 ```bash
-python -m index.search dataset/data/13_a_slice.png --mode col --debug --save-dir index/out/ 
+python -m scripts.search_index dataset/data/13_a_slice.png --k 10 --save-dir results/13_a_slice
 ```
 
 **With a crop slice**
 ```bash
-python -m index.search index/test/test.PNG --mode col --debug --save-dir index/out/ 
+python -m scripts.search_index index/test/test.PNG --k 10 --save-dir results/test
 ```
 
 ## Eval
 ```bash
-python -m eval.run \
-  --mode col \
+python -m scripts.run_eval \
+  --csv dataset/dataset.csv \
+  --source allen \
+  --limit 100 \
   --save-dir eval/out \
-  --final-k 10 \
-  --limit 50
-  --scales 1 8 14
-  --token-scales 8 14
-
+  --save-k 10
 ```
 
 

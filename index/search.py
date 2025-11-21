@@ -1,92 +1,204 @@
+# index/search.py
 from __future__ import annotations
-import argparse
+
+from dataclasses import dataclass
 from pathlib import Path
-import multiprocessing as mp
-import faiss
+from typing import Any, Dict, Iterable, List, Tuple
+
+import numpy as np
+import pandas as pd
+from PIL import Image
 
 from index.store import IndexStore
-from index.searcher import SliceSearcher
-from index.utils import load_image
-from index.visual import save_results_images
+from index.model.dino import model
+from index.utils import log
+from index.config import SLICE_SIZE
 
-def main():
-    p = argparse.ArgumentParser(description="2D→3D search with hybrid coarse retrieval + optional ColBERT rerank")
-    p.add_argument("image", type=str, help="Path to query image (png/jpg/tif)")
 
-    p.add_argument("--mode", type=str, default="col",
-                   choices=["base", "col"],
-                   help="base: hybrid Stage-1 only. col: add ColBERT-style token rerank.")
+@dataclass
+class SearchConfig:
+    """
+    Configuration for image → patch search.
+    """
+    angles: Tuple[float, ...] = (0.0, 90.0, 180.0, 270.0)
+    k_per_angle: int = 64          # how many neighbours per rotation
+    crop_foreground: bool = True   # auto-crop query around tissue
+    bg_threshold: float = 0.05     # pixel threshold for "foreground"
+    min_fg_ratio: float = 0.05     # if less than this, skip cropping
+    verbose: bool = True           # control logging (e.g. auto-crop log)
 
-    p.add_argument("--angles", type=float, nargs="+", default=[0, 90, 180, 270])
-    p.add_argument("--scales", type=int, nargs="+", default=[1, 2, 4, 8, 14],
-                   help="Query token grid sizes for angle×scale embedding.")
-    p.add_argument("--final-k", type=int, default=10)
 
-    # Stage-1 knobs
-    p.add_argument("--base-per-rotation", type=int, default=200,
-                   help="Per-rotation K for global & per-scale coarse indices.")
-    p.add_argument("--base-topk-for-col", type=int, default=300,
-                   help="Total candidate budget merged for Stage-2 rerank.")
+@dataclass
+class SearchResult:
+    """
+    One retrieved patch.
+    """
+    patch_id: int
+    score: float
+    angle: float  # query rotation angle that produced this score
+    meta: Dict[str, Any]  # manifest row as dict
 
-    # Token-ANN knobs
-    p.add_argument("--use-token-ann", action="store_true", default=True,
-                   help="Enable token IVF-PQ coarse shortlist (recommended for crop queries).")
-    p.add_argument("--token-scales", type=int, nargs="+", default=[4, 8, 14],
-                   help="Which query scales to use for token ANN.")
-    p.add_argument("--token-topM", type=int, default=32,
-                   help="TopM per query token in token ANN search.")
-    
-    p.add_argument("--debug", action="store_true", help="Print Stage-1 diagnostics and candidate counts.")
 
-    p.add_argument("--save-dir", type=str, default=None,
-                   help="If set, dump top-K result images for manual QA.")
-    args = p.parse_args()
+class SliceSearcher:
+    """
+    High-level searcher over the patch index.
 
-    store = IndexStore().load_all()
-    searcher = SliceSearcher(store)
+    Typical usage:
+        store = IndexStore().load_all()
+        searcher = SliceSearcher(store)
+        hits = searcher.search_image(img_np, k=10)
+    """
 
-    img = load_image(Path(args.image))
-    hits = searcher.search_image(
-        img_np=img,
-        angles=args.angles,
-        scales=args.scales,
-        mode=args.mode,
-        base_topk_for_col=args.base_topk_for_col,
-        base_per_rotation=args.base_per_rotation,
-        token_topM=args.token_topM,
-        token_scales=args.token_scales,
-        use_token_ann=args.use_token_ann,
-        rerank_final_k=args.final_k,
-        debug=args.debug,   
-    )
+    def __init__(self, store: IndexStore, cfg: SearchConfig | None = None):
+        self.store = store
+        self.cfg = cfg or SearchConfig()
 
-    if not hits:
-        print("No results.")
-        return
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    for i, h in enumerate(hits, 1):
-        h["rank"] = i
+    def search_image(
+        self,
+        img_np: np.ndarray,
+        k: int = 10,
+    ) -> Tuple[List[SearchResult], np.ndarray]:
+        """
+        Search using a query image and ALSO return the preprocessed query
+        actually used for embedding (after grayscale + optional crop).
 
-    print("\nTop results:")
-    for h in hits:
-        n = h["normal"]
-        cols = [
-            f"{h['rank']:02d}. id={h['slice_id']}",
-            f"score={h['score']:.4f}",
-            f"best_rot={h['best_angle']:>6.1f}°",
-            f"base={h['base_score']:.4f}",
-        ]
-        if "col_score" in h:
-            cols.append(f"col={h['col_score']:.4f}")
-        if "best_scale" in h:
-            cols.append(f"scale={h['best_scale']}x{h['best_scale']}")
-        cols.extend([f"n=({n[0]:+.3f},{n[1]:+.3f},{n[2]:+.3f})", f"depth={h['depth_vox']:.1f}"])
-        print("  " + "  ".join(cols))
+        Returns:
+            hits: List[SearchResult]
+            q   : np.ndarray (H,W) in [0,1]
+        """
+        # 1) normalize to grayscale [0,1] and optionally crop
+        q, q_pil = self._prepare_query(img_np)
 
-    if args.save_dir:
-        save_results_images(hits, Path(args.save_dir))
-        print(f"\nSaved result images -> {args.save_dir}")
+        # 2) build rotated views as PIL grayscale
+        angles = self.cfg.angles
+        pils = [q_pil.rotate(float(a), resample=Image.BILINEAR, expand=False) for a in angles]
 
-if __name__ == "__main__":
-    faiss.omp_set_num_threads(max(1, mp.cpu_count() - 1))
-    main()
+        # 3) embed all rotations in a single batch -> (A,D)
+        #    (A = number of angles)
+        G = model.embed_pil_batch(pils).astype(np.float32, copy=False)  # (A, D)
+
+        # 4) single FAISS call for all rotations at once
+        #    D_all, I_all: (A, k_per_angle)
+        D_all, I_all = self.store.search(G, self.cfg.k_per_angle)
+
+        # 5) accumulate best score per patch id over all rotations
+        best: Dict[int, Tuple[float, float]] = {}  # patch_id -> (score, angle)
+
+        for a_idx, angle in enumerate(angles):
+            d_row = D_all[a_idx]
+            i_row = I_all[a_idx]
+
+            for score, pid in zip(d_row, i_row):
+                pid = int(pid)
+                if pid < 0:
+                    continue  # FAISS uses -1 for "no hit"
+                if pid not in best or score > best[pid][0]:
+                    best[pid] = (float(score), float(angle))
+
+        if not best:
+            return [], q
+
+        # 6) sort by score descending and keep top-k
+        sorted_hits = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
+        top = sorted_hits[:k]
+
+        ids = [pid for pid, _ in top]
+        df_rows = self.store.rows_for_ids(ids)
+
+        results: List[SearchResult] = []
+        for pid, (score, angle) in top:
+            row = df_rows.loc[pid]
+            meta = row.to_dict()
+            results.append(
+                SearchResult(
+                    patch_id=int(pid),
+                    score=float(score),
+                    angle=float(angle),
+                    meta=meta,
+                )
+            )
+
+        return results, q
+
+    def to_dataframe(self, hits: List[SearchResult]) -> pd.DataFrame:
+        """
+        Convert a list of SearchResult into a pandas DataFrame.
+        """
+        rows: List[Dict[str, Any]] = []
+        for h in hits:
+            row = dict(h.meta)
+            row["patch_id"] = h.patch_id
+            row["score"] = h.score
+            row["query_angle_deg"] = h.angle
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # Query preprocessing
+    # ------------------------------------------------------------------
+
+    def _prepare_query(self, img_np: np.ndarray) -> Tuple[np.ndarray, Image.Image]:
+        """
+        Full query preprocessing pipeline:
+
+          - convert to grayscale
+          - normalize to float32 [0,1]
+          - optional foreground crop
+          - return both numpy (H,W) and PIL (grayscale) views
+        """
+        x = np.asarray(img_np)
+
+        # Handle channels if present
+        if x.ndim == 3 and x.shape[2] in (1, 3):
+            if x.shape[2] == 3:
+                x = x.mean(axis=2)      # RGB -> gray
+            else:
+                x = x[..., 0]          # (H,W,1) -> (H,W)
+
+        if x.ndim != 2:
+            raise ValueError(f"Expected (H,W) or (H,W,1/3) array, got shape {x.shape}")
+
+        x = x.astype(np.float32, copy=False)
+        if x.max() > 1.0:
+            x = x / 255.0
+        x = np.clip(x, 0.0, 1.0)
+
+        # optional auto-crop on the normalized grayscale
+        if self.cfg.crop_foreground:
+            x = self._auto_crop_foreground(x)
+
+        # build PIL grayscale from the *final* query array
+        x8 = (np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)
+        pil = Image.fromarray(x8, mode="L")
+
+        return x, pil
+
+    def _auto_crop_foreground(self, img: np.ndarray) -> np.ndarray:
+        """
+        Auto-crop around foreground region using a simple intensity threshold.
+        If not enough foreground is found, returns the image unchanged.
+        """
+        cfg = self.cfg
+        mask = img > float(cfg.bg_threshold)
+        fg_ratio = float(mask.sum()) / float(mask.size)
+
+        # Not enough foreground → don't crop at all.
+        if fg_ratio < cfg.min_fg_ratio:
+            return img
+
+        ys, xs = np.where(mask)
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+
+        cropped = img[y0:y1, x0:x1]
+
+        if cfg.verbose:
+            H, W = img.shape
+            ch, cw = cropped.shape
+            log("search", [f"Auto-crop foreground: ({H}x{W}) -> ({ch}x{cw})"])
+
+        return cropped

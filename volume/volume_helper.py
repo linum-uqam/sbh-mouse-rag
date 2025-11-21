@@ -245,16 +245,27 @@ class VolumeHelper:
         self,
         sl: Slice,
         *,
-        ratio_threshold: float = 0.10, 
-        percentiles: tuple[float, float] = (0.5, 99.5),
-        value_threshold_pct: float = 0.10,   # threshold = lo + pct*(hi-lo)
+        ratio_threshold: float = 0.10,
+        value_threshold_pct: float = 0.10,
     ) -> bool:
-        if not self._global_lo:
-            self._global_lo, self._global_hi = np.percentile(sl.image, percentiles)
+        """
+        Decide whether a slice contains enough tissue vs background.
 
-        thr = self._global_lo + value_threshold_pct * (self._global_hi - self._global_lo)
-        mask = sl.image > thr
-        return (mask.sum() / sl.image.size) > ratio_threshold
+        Uses global volume bounds:
+        - If volume is raw: (_global_lo, _global_hi) computed once in _set_volume.
+        - If volume is normalized: (_global_lo, _global_hi) = (0, 1).
+
+        Threshold is: thr = lo + value_threshold_pct * (hi - lo).
+        """
+        if self._global_lo is None or self._global_hi is None:
+            raise RuntimeError("Global intensity bounds not initialized")
+
+        lo, hi = self._global_lo, self._global_hi
+        thr = lo + value_threshold_pct * (hi - lo)
+
+        img = sl.image
+        mask = img > thr
+        return (mask.sum() / img.size) > ratio_threshold
     
     # ---------- tiny internals now in the class ----------
     @staticmethod

@@ -1,6 +1,7 @@
 # index/geom.py
 from __future__ import annotations
 from typing import Generator, Optional, Tuple, List, Dict
+
 import math
 import numpy as np
 
@@ -8,30 +9,6 @@ from volume.volume_helper import VolumeHelper, AnnotationHelper, Slice
 from index.config import FIXED_ROTATIONS, FIXED_PIXEL_STEP_VOX, FIXED_STEP_VOX, FIXED_MARGIN_VOX
 
 # ------------------------- internal helpers -------------------------
-
-def count_slices_fibonacci(
-    vol_helper: VolumeHelper,
-    *,
-    k_normals: int,
-) -> int:
-    """
-    Exact count of slices iter_slices_fibonacci(...) will yield,
-    using the same fixed internal settings.
-    """
-    Z, Y, X = vol_helper.get_dimension()
-    normals = _spherical_fibonacci_normals(k_normals)
-    total = 0
-    for n in normals:
-        n_arr = np.asarray(n, dtype=np.float64)
-        n_arr /= (np.linalg.norm(n_arr) + 1e-12)
-        depths = _depth_schedule_step(
-            (Z, Y, X),
-            tuple(n_arr.tolist()),
-            step_vox=FIXED_STEP_VOX,
-            margin_vox=FIXED_MARGIN_VOX,
-        )
-        total += len(depths) * len(FIXED_ROTATIONS)
-    return total
 
 
 def _spherical_fibonacci_normals(k: int) -> List[Tuple[float, float, float]]:
@@ -102,7 +79,63 @@ def _depth_schedule_step(
     return dmin + np.arange(count, dtype=np.float64) * step_vox
 
 
+# ------------------------- planning helper -------------------------
+
+
+def plan_slices_fibonacci(
+    vol_helper: VolumeHelper,
+    *,
+    k_normals: int,
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray]], int]:
+    """
+    Precompute geometry for Fibonacci-sphere slicing.
+
+    Returns
+    -------
+    (plan, total_slices)
+      - plan: list of (normal_xyz_unit, depths_1d) where:
+          normal_xyz_unit: np.ndarray shape (3,)
+          depths_1d       : np.ndarray of depths along that normal
+      - total_slices: total number of (normal, depth, rotation) combinations
+                      using FIXED_ROTATIONS.
+    """
+    Z, Y, X = vol_helper.get_dimension()
+    normals = _spherical_fibonacci_normals(k_normals)
+
+    plan: List[Tuple[np.ndarray, np.ndarray]] = []
+    total_slices = 0
+
+    for n in normals:
+        n_arr = np.asarray(n, dtype=np.float64)
+        n_arr /= (np.linalg.norm(n_arr) + 1e-12)
+
+        depths = _depth_schedule_step(
+            (Z, Y, X),
+            tuple(n_arr.tolist()),
+            step_vox=FIXED_STEP_VOX,
+            margin_vox=FIXED_MARGIN_VOX,
+        )
+        plan.append((n_arr, depths))
+        total_slices += len(depths) * len(FIXED_ROTATIONS)
+
+    return plan, total_slices
+
+
 # ------------------------- public API -------------------------
+
+
+def count_slices_fibonacci(
+    vol_helper: VolumeHelper,
+    *,
+    k_normals: int,
+) -> int:
+    """
+    Exact count of slices iter_slices_fibonacci(...) will yield,
+    using the same fixed internal settings.
+    """
+    _, total = plan_slices_fibonacci(vol_helper, k_normals=k_normals)
+    return total
+
 
 def iter_slices_fibonacci(
     vol_helper: VolumeHelper,
@@ -112,13 +145,13 @@ def iter_slices_fibonacci(
     linear_interp: bool = True,
     include_annotation: bool = False,
     annotation_helper: Optional[AnnotationHelper] = None,
-) -> Generator[Tuple[Slice, Dict[str, float]], None, None]:
+) -> Tuple[Generator[Tuple[Slice, Dict[str, float]], None, None], int]:
     """
-    Generate slices using k Fibonacci-sphere normals.
+    Return (iterator, total_slices) for Fibonacci-sphere sampling.
 
     Fixed internal settings:
       - depths: every voxel plane along each normal (step_vox=1.0, margin=0.0)
-      - rotations: [0.0] (no in-plane rotation baked in)
+      - rotations: FIXED_ROTATIONS
       - pixel spacing: 1.0 voxel/pixel
 
     Parameters
@@ -136,42 +169,40 @@ def iter_slices_fibonacci(
     annotation_helper : Optional[AnnotationHelper]
         Required for Nifti volumes if include_annotation=True.
 
-    Yields
-    ------
-    (Slice, info_dict)
-        info_dict keys: normal_idx, depth_idx, rot_idx,
-                        normal_xyz_unit, depth_vox, rotation_deg
+    Returns
+    -------
+    (it, total_slices)
+        it           : generator yielding (Slice, info_dict)
+        total_slices : exact number of slices that will be yielded
     """
-    Z, Y, X = vol_helper.get_dimension()
-    normals = _spherical_fibonacci_normals(k_normals)
+    plan, total_slices = plan_slices_fibonacci(vol_helper, k_normals=k_normals)
 
-    for ni, n in enumerate(normals):
-        n_arr = np.asarray(n, dtype=np.float64)
-        n_arr /= (np.linalg.norm(n_arr) + 1e-12)
+    def _gen() -> Generator[Tuple[Slice, Dict[str, float]], None, None]:
+        for ni, (n_arr, depths) in enumerate(plan):
+            n_arr = n_arr.astype(np.float64)
+            n_arr /= (np.linalg.norm(n_arr) + 1e-12)
+            normal_tuple = tuple(float(x) for x in n_arr.tolist())
 
-        depths = _depth_schedule_step(
-            (Z, Y, X),
-            tuple(n_arr.tolist()),
-            step_vox=FIXED_STEP_VOX,
-            margin_vox=FIXED_MARGIN_VOX,
-        )
+            for di, d in enumerate(depths):
+                for ri, rot in enumerate(FIXED_ROTATIONS):
+                    s = vol_helper.get_slice(
+                        normal=normal_tuple,
+                        depth=float(d),
+                        rotation=float(rot),
+                        size=int(size_px),
+                        pixel=FIXED_PIXEL_STEP_VOX,
+                        linear_interp=linear_interp,
+                        include_annotation=include_annotation,
+                        annotation_helper=annotation_helper,
+                    )
+                    info = {
+                        "normal_idx": ni,
+                        "depth_idx": di,
+                        "rot_idx": ri,
+                        "normal_xyz_unit": normal_tuple,
+                        "depth_vox": float(d),
+                        "rotation_deg": float(rot),
+                    }
+                    yield s, info
 
-        for di, d in enumerate(depths):
-            for ri, rot in enumerate(FIXED_ROTATIONS):
-                s = vol_helper.get_slice(
-                    normal=tuple(n_arr.tolist()),
-                    depth=float(d),
-                    rotation=float(rot),
-                    size=int(size_px),
-                    pixel=FIXED_PIXEL_STEP_VOX,
-                    linear_interp=linear_interp,
-                    include_annotation=include_annotation,
-                    annotation_helper=annotation_helper,
-                )
-                info = {
-                    "normal_idx": ni, "depth_idx": di, "rot_idx": ri,
-                    "normal_xyz_unit": tuple(n_arr.tolist()),
-                    "depth_vox": float(d),
-                    "rotation_deg": float(rot),
-                }
-                yield s, info
+    return _gen(), total_slices

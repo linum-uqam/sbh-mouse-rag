@@ -1,19 +1,23 @@
 # eval/evaluator.py
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
 
 import time
+import random
+
 import numpy as np
+import pandas as pd
 from tqdm.auto import tqdm
 
-from dataset.data_loader import DataLoader
 from volume.volume_helper import Slice
+from dataset import MouseBrainDatasetLoader  # new dataset API
 
 from index.store import IndexStore
-from index.searcher import SliceSearcher
-from index.visual import save_results_images
-import random
+from index.search import SliceSearcher, SearchConfig, SearchResult
+from index.vis import save_search_results_visuals
+
 
 class RunningStats:
     def __init__(self) -> None:
@@ -21,22 +25,16 @@ class RunningStats:
         self.rows_done = 0
         self.sum_top1_score = 0.0
         self.sum_latency_s = 0.0
-        self.sum_top1_delta_col = 0.0
-        self.rows_with_col = 0
 
     def update_row(
         self,
         latency_s: float,
         row_top1_scores: List[float],
-        row_top1_deltas: List[float],
     ) -> None:
         self.rows_done += 1
         self.sum_latency_s += latency_s
         if row_top1_scores:
             self.sum_top1_score += float(np.nanmean(row_top1_scores))
-        if row_top1_deltas:
-            self.sum_top1_delta_col += float(np.nanmean(row_top1_deltas))
-            self.rows_with_col += 1
 
     @property
     def avg_top1(self) -> float:
@@ -46,15 +44,11 @@ class RunningStats:
     def avg_latency_ms(self) -> float:
         return ((self.sum_latency_s / self.rows_done) * 1000.0) if self.rows_done else 0.0
 
-    @property
-    def avg_delta_col(self) -> float:
-        return (self.sum_top1_delta_col / self.rows_with_col) if self.rows_with_col else 0.0
-
 
 class Evaluator:
     """
     Stateful evaluator:
-      - Holds all knobs as attributes (no separate config object)
+      - Holds all knobs as attributes
       - Owns searcher, dataloader, stats, logging, and run() loop
     """
 
@@ -72,21 +66,16 @@ class Evaluator:
         allen_res_um: int = 25,
         real_volume_path: Optional[str] = "volume/data/real/real_mouse_brain_ras_25um.nii.gz",
 
-        # Slice sampling
+        # Slice sampling (eval-time)
         size_px: int = 512,
         pixel_step_vox: float = 1.0,
-        linear_interp: bool = False,                        # False for faster results, and True for better results. 
+        linear_interp: bool = False,                        # False for faster; True for better
 
-        # Index/search
-        mode: str = "col",                                  # "base" | "col"
+        # Search
         angles: Tuple[float, ...] = (0, 90, 180, 270),
-        scales: Tuple[int, ...] = (1, 2, 4, 8, 14),
         final_k: int = 10,
-        base_per_rotation: int = 200,
-        base_topk_for_col: int = 300,
-        use_token_ann: bool = True,
-        token_scales: Tuple[int, ...] = (4, 8, 14),
-        token_topM: int = 32,
+        k_per_angle: int = 64,
+        crop_foreground: bool = True,
         debug: bool = False,
 
         # Output
@@ -108,26 +97,29 @@ class Evaluator:
         self.pixel_step_vox = pixel_step_vox
         self.linear_interp = linear_interp
 
-        self.mode = mode
         self.angles = angles
-        self.scales = scales
         self.final_k = final_k
-        self.base_per_rotation = base_per_rotation
-        self.base_topk_for_col = base_topk_for_col
-        self.use_token_ann = use_token_ann
-        self.token_scales = token_scales
-        self.token_topM = token_topM
+        self.k_per_angle = k_per_angle
+        self.crop_foreground = crop_foreground
         self.debug = debug
-        
+
         self.save_dir = save_dir
         self.save_k = save_k
         self.save_seed = save_seed
 
-        # --- build deps once ---
+        # --- build deps once: index + searcher ---
         self.store = IndexStore().load_all()
-        self.searcher = SliceSearcher(self.store)
 
-        self.dl = DataLoader(
+        self.search_cfg = SearchConfig(
+            angles=self.angles,
+            k_per_angle=self.k_per_angle,
+            crop_foreground=self.crop_foreground,
+            verbose=self.debug,
+        )
+        self.searcher = SliceSearcher(self.store, cfg=self.search_cfg)
+
+        # --- dataset loader (new dataset API) ---
+        self.dl = MouseBrainDatasetLoader(
             csv_path=self.csv_path,
             allen_cache_dir=self.allen_cache_dir,
             allen_resolution_um=self.allen_res_um,
@@ -141,11 +133,18 @@ class Evaluator:
         self.stats = RunningStats()
         self.stats.rows_total = len(self.dl)
 
+        # --- output paths ---
         self.out_root = Path(self.save_dir) if self.save_dir else None
         if self.out_root:
             self.out_root.mkdir(parents=True, exist_ok=True)
+            self.results_csv_path = self.out_root / "eval_hits.csv"
+        else:
+            self.results_csv_path = None
 
-        self._set_random_rows() 
+        # collect detailed per-hit records for CSV
+        self._records: List[Dict[str, Any]] = []
+
+        self._set_random_rows()
 
     # ---------------- public API ----------------
     def run(self) -> None:
@@ -159,40 +158,44 @@ class Evaluator:
             t0 = time.perf_counter()
 
             src_list = self._source_list(sample)   # [('allen', Slice), ('real', Slice?)]
+
             row_top1_scores: List[float] = []
-            row_top1_deltas: List[float] = []
 
             for src_name, sl in src_list:
                 img = self._prep_img_from_slice(sl)
-                hits = self._query(img)
+                hits, qimg = self._query(img)
                 if not hits:
                     continue
 
-                for r, h in enumerate(hits, 1):
-                    h["rank"] = r
+                # top-1 score
+                top1 = hits[0]
+                row_top1_scores.append(float(top1.score))
 
+                # Logging (only if debug=True)
                 self._log_hits(idx, src_name, sl, hits)
 
-                top1 = hits[0]
-                row_top1_scores.append(float(top1.get("score", float("nan"))))
-                if "col_score" in top1 and "base_score" in top1:
-                    row_top1_deltas.append(float(top1["col_score"] - top1["base_score"]))
+                # Record hits for CSV
+                self._record_hits(idx, src_name, sl, hits)
 
+                # Optional image saving
                 if self.out_root and idx in self._rows_to_save:
                     qdir = self.out_root / f"{idx:05d}_{src_name}"
                     qdir.mkdir(parents=True, exist_ok=True)
-                    save_results_images(hits, qdir)
+                    save_search_results_visuals(
+                        hits,
+                        qimg,
+                        qdir,
+                        verbose=self.debug,
+                    )
 
             latency = time.perf_counter() - t0
             self.stats.update_row(
                 latency_s=latency,
                 row_top1_scores=row_top1_scores,
-                row_top1_deltas=row_top1_deltas,
             )
 
             pbar.set_postfix({
                 "top1": f"{self.stats.avg_top1:7.4f}",
-                "Δcol": f"{self.stats.avg_delta_col:+7.4f}",
                 "lat": f"{self.stats.avg_latency_ms:6.0f}ms",
             })
             pbar.update(1)
@@ -200,11 +203,22 @@ class Evaluator:
         pbar.close()
         self._print_summary()
 
+        # Write detailed per-hit CSV (if requested)
+        if self.results_csv_path and self._records:
+            df = pd.DataFrame(self._records)
+            self.results_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(self.results_csv_path, index=False)
+            print(f"Detailed results CSV saved to: {self.results_csv_path}")
+
     # ---------------- internals ----------------
     def _source_list(self, sample: Dict[str, Any]) -> List[Tuple[str, Slice]]:
+        """
+        Map loader sample -> list of (source_name, Slice) to evaluate.
+        Loader is expected to return {"allen": Slice, "real": Optional[Slice], "row": DatasetRow}.
+        """
         source = self.source
         allen_sl: Slice = sample["allen"]
-        real_sl: Optional[Slice] = sample["real"]
+        real_sl: Optional[Slice] = sample.get("real")
 
         out: List[Tuple[str, Slice]] = []
         if source in ("allen", "both"):
@@ -212,8 +226,8 @@ class Evaluator:
         if source in ("real", "both") and real_sl is not None:
             out.append(("real", real_sl))
         return out
-    
-    def _set_random_rows(self):
+
+    def _set_random_rows(self) -> None:
         self._rows_to_process = (len(self.dl) if self.limit is None else min(self.limit, len(self.dl)))
         self._rows_to_save: set[int] = set()
         if self.out_root and self.save_k is not None and self.save_k > 0:
@@ -229,41 +243,46 @@ class Evaluator:
             img = img.astype(np.float32, copy=False)
         return img
 
-    def _query(self, img_np: np.ndarray) -> List[Dict[str, Any]]:
-        return self.searcher.search_image(
+    def _query(self, img_np: np.ndarray) -> Tuple[List[SearchResult], np.ndarray]:
+        """
+        Run search and return (hits, query_img_used).
+        """
+        hits, qimg = self.searcher.search_image(
             img_np=img_np,
-            angles=list(self.angles),
-            scales=list(self.scales),
-            mode=self.mode,
-            base_topk_for_col=self.base_topk_for_col,
-            base_per_rotation=self.base_per_rotation,
-            token_topM=self.token_topM,
-            token_scales=list(self.token_scales),
-            use_token_ann=self.use_token_ann,
-            rerank_final_k=self.final_k,
-            debug=self.debug,
-        ) or []
+            k=self.final_k,
+        )
+        return hits or [], qimg
 
-    def _log_hits(self, idx: int, src_name: str, sl: Slice, hits: List[Dict[str, Any]]) -> None:
+    def _log_hits(
+        self,
+        idx: int,
+        src_name: str,
+        sl: Slice,
+        hits: List[SearchResult],
+    ) -> None:
+        # If not debugging, stay silent
+        if not self.debug:
+            return
+
         nlog = tuple(round(x, 3) for x in sl.normal_xyz_unit)
         print(f"[{idx:05d}/{src_name}] n={nlog} depth={sl.depth_vox:.1f} rot={sl.rotation_deg:.1f}")
         N = min(5, len(hits))
-        for h in hits[:N]:
-            n = h["normal"]
+        for rank, h in enumerate(hits[:N], start=1):
+            m = h.meta
+            n = (
+                m.get("normal_x", 0.0),
+                m.get("normal_y", 0.0),
+                m.get("normal_z", 0.0),
+            )
             cols = [
-                f"{h['rank']:02d} id={h['slice_id']}",
-                f"score={h['score']:.4f}",
-                f"base={h.get('base_score', float('nan')):.4f}",
-                f"best_rot={h.get('best_angle', 0.0):>6.1f}°",
-            ]
-            if "col_score" in h:
-                cols.append(f"col={h['col_score']:.4f}")
-            if "best_scale" in h:
-                cols.append(f"scale={h['best_scale']}x{h['best_scale']}")
-            cols.extend([
+                f"{rank:02d} pid={h.patch_id}",
+                f"score={h.score:.4f}",
+                f"q_angle={h.angle:5.1f}°",
                 f"n=({n[0]:+.3f},{n[1]:+.3f},{n[2]:+.3f})",
-                f"depth={h['depth_vox']:.1f}",
-            ])
+                f"depth={m.get('depth_vox', float('nan')):.1f}",
+                f"scale={m.get('scale', '?')}",
+                f"box=({m.get('x0','?')},{m.get('y0','?')})-({m.get('x1','?')},{m.get('y1','?')})",
+            ]
             print("  " + "  ".join(cols))
 
     def _print_summary(self) -> None:
@@ -273,5 +292,53 @@ class Evaluator:
         if s.rows_done:
             print(f"Avg Top-1 score: {s.avg_top1:.4f}")
             print(f"Avg latency    : {s.avg_latency_ms:.0f} ms")
-            if s.rows_with_col:
-                print(f"Avg Δ(col-base) on Top-1 (rows w/ col): {s.avg_delta_col:+.4f}")
+
+    def _record_hits(
+        self,
+        idx: int,
+        src_name: str,
+        sl: Slice,
+        hits: List[SearchResult],
+    ) -> None:
+        """
+        Append one record per (row, hit) to self._records for later CSV export.
+        """
+        qnx, qny, qnz = sl.normal_xyz_unit
+        q_depth = float(sl.depth_vox)
+        q_rot = float(sl.rotation_deg)
+
+        for rank, h in enumerate(hits, start=1):
+            m = h.meta
+            rec = {
+                "row_idx": idx,
+                "source": src_name,
+                "rank": rank,
+                "patch_id": h.patch_id,
+                "score": h.score,
+                "query_angle_deg": h.angle,
+                # query pose
+                "q_normal_x": float(qnx),
+                "q_normal_y": float(qny),
+                "q_normal_z": float(qnz),
+                "q_depth_vox": q_depth,
+                "q_rot_deg": q_rot,
+                # retrieved patch pose / metadata
+                "normal_idx": m.get("normal_idx"),
+                "depth_idx": m.get("depth_idx"),
+                "rot_idx": m.get("rot_idx"),
+                "normal_x": m.get("normal_x"),
+                "normal_y": m.get("normal_y"),
+                "normal_z": m.get("normal_z"),
+                "depth_vox": m.get("depth_vox"),
+                "rotation_deg": m.get("rotation_deg"),
+                "scale": m.get("scale"),
+                "patch_row": m.get("patch_row"),
+                "patch_col": m.get("patch_col"),
+                "x0": m.get("x0"),
+                "y0": m.get("y0"),
+                "x1": m.get("x1"),
+                "y1": m.get("y1"),
+                "patch_h": m.get("patch_h"),
+                "patch_w": m.get("patch_w"),
+            }
+            self._records.append(rec)

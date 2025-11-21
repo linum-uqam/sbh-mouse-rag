@@ -1,6 +1,6 @@
 # index/model/dino.py
 from __future__ import annotations
-from typing import Iterable, List, Dict, Tuple
+from typing import Iterable, List, Dict
 import numpy as np
 from PIL import Image
 
@@ -12,11 +12,11 @@ from transformers import AutoImageProcessor, AutoModel
 class _HFVisionEncoder:
     """
     Minimal DINOv3 wrapper (ViT-Base/16 by default) with:
-      - embed(img) -> (D,)
-      - embed_tokens(img) -> (T,D)  [patch tokens only; no CLS; T = H*W]
-      - embed_both(img) -> {"global": (D,), "tokens": (T,D)}
-      - embed_query_rotations(img, angles=[0,90,180,270]) -> List[{"angle","global","tokens"}]
-      - embed_query_augmentations(img, angles, scales) -> rotations, each with pooled (k×k) query tokens + masks
+      - embed(img_np) -> (D,)
+      - embed_tokens(img_np) -> (T,D)  [patch tokens only; no CLS; T = H*W]
+      - embed_both(img_np) -> {"global": (D,), "tokens": (T,D)}
+      - embed_batch(imgs_np) -> (N,D)
+      - embed_pil_batch(pils) -> (N,D)
 
     Notes
     -----
@@ -50,7 +50,10 @@ class _HFVisionEncoder:
 
     @staticmethod
     def _to_pil_rgb(img_np: np.ndarray) -> Image.Image:
-        """(H,W) or (H,W,1/3) in [0,1] or uint8 -> PIL RGB."""
+        """
+        (H,W) or (H,W,1/3) in [0,1] or uint8 -> PIL RGB.
+        Grayscale inputs are kept as luminance and expanded to 3 channels.
+        """
         if img_np.ndim == 2:  # grayscale
             x = img_np
             if x.dtype != np.uint8:
@@ -70,7 +73,9 @@ class _HFVisionEncoder:
 
     def _prep_batch(self, pil_list: List[Image.Image]) -> torch.Tensor:
         """Processor handles resize/crop/normalize to model expected size."""
-        return self.processor(images=pil_list, return_tensors="pt")["pixel_values"].to(self.device, dtype=self.dtype)
+        return self.processor(images=pil_list, return_tensors="pt")["pixel_values"].to(
+            self.device, dtype=self.dtype
+        )
 
     # ---------------- Token / Forward utils ----------------
 
@@ -83,13 +88,15 @@ class _HFVisionEncoder:
         need = self.grid_hw * self.grid_hw
 
         if L >= need + 1:
-            patches = last_hidden[:, 1:1 + need, :]
+            patches = last_hidden[:, 1 : 1 + need, :]
         elif L == need:
             patches = last_hidden
         elif L > need:
-            patches = last_hidden[:, L - need:L, :]
+            patches = last_hidden[:, L - need : L, :]
         else:
-            raise ValueError(f"Not enough tokens: L={L}, need≥{need} (grid={self.grid_hw}x{self.grid_hw})")
+            raise ValueError(
+                f"Not enough tokens: L={L}, need≥{need} (grid={self.grid_hw}x{self.grid_hw})"
+            )
 
         assert patches.shape[1] == need, f"Token trim mismatch: {patches.shape[1]} vs expected {need}"
         return patches
@@ -121,12 +128,6 @@ class _HFVisionEncoder:
         p = F.normalize(p, p=2, dim=-1).to(dtype=torch.float32).cpu()
         return {"global": g, "tokens": p}
 
-    @staticmethod
-    def _l2norm_rows_np(a: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-        """Row-wise L2 normalize in NumPy (used after pooling)."""
-        n = np.linalg.norm(a, axis=1, keepdims=True)
-        return a / (n + eps)
-
     # ---------------- Public: simple embed APIs ----------------
 
     def embed(self, img_np: np.ndarray) -> np.ndarray:
@@ -157,165 +158,17 @@ class _HFVisionEncoder:
         feats = self._forward(batch)["global"]  # (N,D)
         return feats.numpy()
 
-    # ---------------- Rotation batching ----------------
-
-    def _embed_rotations_np(
-        self,
-        img_np: np.ndarray,
-        angles: Iterable[float],
-        resample: int = Image.BILINEAR,
-    ) -> Tuple[List[Image.Image], np.ndarray, np.ndarray]:
+    def embed_pil_batch(self, pils: Iterable[Image.Image]) -> np.ndarray:
         """
-        Rotate input once per angle, run forward in a single batch.
-        Returns:
-          - pils: rotated PIL images (for mask creation)
-          - G: (A,D) globals
-          - T: (A, H*W, D) tokens (row-normalized)
+        Global embeddings from a batch of PIL images -> (N,D).
+        Useful when the caller already has PILs (e.g. rotations).
         """
-        pil0 = self._to_pil_rgb(img_np)
-        pils = [pil0.rotate(float(a), resample=resample, expand=False) for a in angles]
-        batch = self._prep_batch(pils)
-        out = self._forward(batch)
-        G = out["global"].numpy()
-        T = out["tokens"].numpy()
-        return pils, G, T
-
-    # ---------------- Public: query rotations ----------------
-
-    def embed_query_rotations(
-        self,
-        img_np: np.ndarray,
-        angles: Iterable[float] = (0.0, 90.0, 180.0, 270.0),
-        resample: int = Image.BILINEAR,
-    ) -> List[Dict[str, np.ndarray]]:
-        """
-        Rotation augmentation only.
-        Returns a list of dicts with angle, global, tokens (14×14).
-        """
-        pils, G, T = self._embed_rotations_np(img_np, angles, resample=resample)
-        results: List[Dict[str, np.ndarray]] = []
-        for i, a in enumerate(angles):
-            results.append({
-                "angle": float(a),
-                "global": G[i].astype(np.float32).copy(),      # (D,)
-                "tokens": T[i].astype(np.float32).copy(),      # (196,D) for ViT-B/16 224px
-            })
-        return results
-
-    # ---------------- Mask & pooling helpers ----------------
-
-    @staticmethod
-    def _pil_to_mask_grid(pil_img: Image.Image, grid_hw: int, bg_threshold: float = 0.02) -> np.ndarray:
-        """
-        Downsample PIL grayscale to (grid_hw,grid_hw) and threshold to boolean foreground.
-        """
-        g = pil_img.convert("L").resize((grid_hw, grid_hw), resample=Image.BILINEAR)
-        arr = np.asarray(g, dtype=np.float32) / 255.0
-        return (arr >= float(bg_threshold))  # (grid_hw, grid_hw) bool
-
-    @staticmethod
-    def _bins(in_hw: int, out_hw: int) -> List[Tuple[int, int]]:
-        """
-        Adaptive-avg-pool-style integer binning boundaries (start, end) for each pooled cell.
-        """
-        import math
-        bounds: List[Tuple[int, int]] = []
-        for i in range(out_hw):
-            start = math.floor((i * in_hw) / out_hw)
-            end = math.floor(((i + 1) * in_hw) / out_hw)
-            # guarantee at least one element
-            end = max(end, start + 1)
-            bounds.append((start, end))
-        return bounds
-
-    def _pool_tokens_and_mask(
-        self,
-        tokens14: np.ndarray,    # (196,D)
-        qmask14_hw: np.ndarray,  # (14,14) bool
-        out_hw: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Adaptive-average pooling for tokens and majority pooling for masks.
-        Returns:
-          - Qt: (out_hw*out_hw, D) row-normalized
-          - qm: (out_hw*out_hw,) bool
-        """
-        ghw = int(self.grid_hw)
-        if out_hw == ghw:
-            Qt = tokens14.astype(np.float32, copy=True)
-            qm = qmask14_hw.reshape(-1).copy()
-            return Qt, qm
-
-        x = tokens14.reshape(ghw, ghw, tokens14.shape[1])  # (14,14,D)
-        out_tok = np.zeros((out_hw, out_hw, x.shape[2]), dtype=np.float32)
-
-        rows = self._bins(ghw, out_hw)
-        cols = self._bins(ghw, out_hw)
-        for oi, (rs, re) in enumerate(rows):
-            for oj, (cs, ce) in enumerate(cols):
-                patch = x[rs:re, cs:ce, :]
-                out_tok[oi, oj, :] = patch.mean(axis=(0, 1))
-
-        Qt = out_tok.reshape(out_hw * out_hw, x.shape[2]).astype(np.float32)
-        Qt = self._l2norm_rows_np(Qt)
-
-        # mask: keep if >= 5% foreground within block
-        m = qmask14_hw
-        out_m = np.zeros((out_hw, out_hw), dtype=bool)
-        for oi, (rs, re) in enumerate(rows):
-            for oj, (cs, ce) in enumerate(cols):
-                block = m[rs:re, cs:ce]
-                out_m[oi, oj] = (block.mean() >= 0.05)
-
-        qm = out_m.reshape(-1)
-        return Qt, qm
-
-    # ---------------- Public: query (angle × scale) augmentations ----------------
-
-    def embed_query_augmentations(
-        self,
-        img_np: np.ndarray,
-        *,
-        angles: Iterable[float] = (0.0, 90.0, 180.0, 270.0),
-        scales: Iterable[int] = (1, 2, 4, 8, 14),
-        resample: int = Image.BILINEAR,
-    ) -> List[Dict]:
-        """
-        Returns a list over rotations. Each item:
-        {
-          "angle": float,
-          "global": (D,),
-          "tokens14": (196,D),      # 14x14 row-normalized
-          "qmask14": (196,) bool,   # 14x14 flattened
-          "scales": [
-            {"k": k, "Qt": (k*k,D), "qm": (k*k,) bool}  # row-normalized, pooled
-            for k in scales
-          ]
-        }
-        """
-        pils, G, T = self._embed_rotations_np(img_np, angles, resample=resample)
-        ghw = int(self.grid_hw)
-
-        results: List[Dict] = []
-        for i, a in enumerate(angles):
-            tokens14 = T[i].astype(np.float32)                # (196,D), already L2-normalized
-            qmask14_hw = self._pil_to_mask_grid(pils[i], ghw) # (14,14)
-            qmask14 = qmask14_hw.reshape(-1)
-
-            scales_list = []
-            for k in scales:
-                k = int(k)
-                Qt, qm = self._pool_tokens_and_mask(tokens14, qmask14_hw, out_hw=k)
-                scales_list.append({"k": k, "Qt": Qt, "qm": qm})
-
-            results.append({
-                "angle": float(a),
-                "global": G[i].astype(np.float32).copy(),
-                "tokens14": tokens14,
-                "qmask14": qmask14,
-                "scales": scales_list,
-            })
-        return results
+        pil_list = list(pils)
+        if not pil_list:
+            return np.zeros((0, self.encoder.config.hidden_size), dtype=np.float32)
+        batch = self._prep_batch(pil_list)
+        feats = self._forward(batch)["global"]  # (N,D)
+        return feats.numpy()
 
 
 # Public instance (stable import)

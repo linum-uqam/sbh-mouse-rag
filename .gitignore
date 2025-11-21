@@ -6,6 +6,8 @@ index/index/*
 volume/data/*
 dataset/dataset.csv
 */out/*
+eval_out/*
+results/*
 todo
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
