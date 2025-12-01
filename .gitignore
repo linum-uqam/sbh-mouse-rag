@@ -2,12 +2,14 @@ dataset/data/*
 .vscode/
 uv.lock
 
+trash*
 index/index/*
 volume/data/*
 dataset/dataset.csv
 */out/*
 eval_out/*
 results/*
+out/*
 todo
 
 # Created by https://www.toptal.com/developers/gitignore/api/python

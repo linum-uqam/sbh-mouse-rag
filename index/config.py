@@ -2,7 +2,7 @@
 from pathlib import Path
 
 # --- Paths ---
-OUT_DIR = Path("index/out")
+OUT_DIR = Path("out/index/")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Geometry / sampling ---

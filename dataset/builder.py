@@ -86,15 +86,46 @@ class PlaneSampler:
 class CropSampler:
     min_frac: float
     max_frac: float
+    n_bins: int = 4       # how many distinct scale bands (small/med/large...)
+    jitter: float = 0.15  # how much to jitter around the bin center (15%)
 
     def sample_crop_params(self) -> Tuple[float, float, float, float]:
         """
         Sample normalized crop parameters (cx, cy, rw, rh) in [0,1].
+
+        Strategy:
+          - Split [min_frac, max_frac] into `n_bins` bins.
+          - Pick a bin center for width & height (independently).
+          - Jitter each center by up to ±`jitter` proportion (clamped to [min,max]).
+          - Sample center (cx, cy) uniformly in [0,1].
         """
-        rw = random.uniform(self.min_frac, self.max_frac)
-        rh = random.uniform(self.min_frac, self.max_frac)
+        min_f = float(self.min_frac)
+        max_f = float(self.max_frac)
+        if not (0.0 < min_f <= max_f <= 1.0):
+            raise ValueError("min_frac/max_frac must be in (0,1] and min_frac <= max_frac")
+
+        # Bin centers between min and max (small → large crops)
+        centers = np.linspace(min_f, max_f, num=self.n_bins)
+
+        # Pick a center independently for width and height
+        c_w = float(random.choice(centers))
+        c_h = float(random.choice(centers))
+
+        def jitter_one(c: float) -> float:
+            # Allow +/- jitter on the center, but clamp to [min_f, max_f]
+            low = max(min_f, c * (1.0 - self.jitter))
+            high = min(max_f, c * (1.0 + self.jitter))
+            if high <= low:
+                return c
+            return random.uniform(low, high)
+
+        rw = jitter_one(c_w)
+        rh = jitter_one(c_h)
+
+        # Random crop center in normalized coordinates
         cx = random.uniform(0.0, 1.0)
         cy = random.uniform(0.0, 1.0)
+
         return float(cx), float(cy), float(rw), float(rh)
 
 

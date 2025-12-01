@@ -13,8 +13,8 @@ class DatasetConfig:
     """
 
     # Output paths
-    out_dir: Path = Path("dataset/data")
-    csv_path: Path = Path("dataset/dataset.csv")
+    out_dir: Path = Path("out/dataset/data")
+    csv_path: Path = Path("out/dataset/dataset.csv")
 
     # Volumes
     allen_cache_dir: str = "volume/data/allen"

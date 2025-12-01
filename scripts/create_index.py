@@ -85,7 +85,7 @@ def main() -> None:
     ])
 
     # 1) Load Allen volume
-    allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=10)
+    allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=25)
 
     # 2) Build configs
     sampling_cfg = PatchSamplingConfig(

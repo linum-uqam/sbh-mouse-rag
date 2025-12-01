@@ -8,6 +8,7 @@ from pathlib import Path
 import faiss
 
 from eval.evaluator import Evaluator
+from eval.config import EvalConfig
 from dataset import DatasetConfig  # for default CSV path
 
 
@@ -146,14 +147,14 @@ def main() -> None:
     faiss.omp_set_num_threads(max(1, mp.cpu_count() - 1))
     a = parse_args()
 
-    Evaluator(
-        csv_path=a.csv,
+    cfg = EvalConfig(
+        csv_path=Path(a.csv),
         source=a.source,
         limit=a.limit,
         include_annotation=a.include_annotation,
         allen_cache_dir=a.allen_cache_dir,
         allen_res_um=a.allen_res_um,
-        real_volume_path=a.real_volume_path,
+        real_volume_path=Path(a.real_volume_path) if a.real_volume_path else None,
         size_px=a.size_px,
         pixel_step_vox=a.pixel_step_vox,
         linear_interp=a.linear_interp,
@@ -162,10 +163,12 @@ def main() -> None:
         k_per_angle=a.k_per_angle,
         crop_foreground=not a.no_crop,
         debug=a.debug,
-        save_dir=a.save_dir,
+        save_dir=Path(a.save_dir) if a.save_dir else None,
         save_k=a.save_k,
         save_seed=a.save_seed,
-    ).run()
+    )
+
+    Evaluator(cfg).run()
 
 
 if __name__ == "__main__":

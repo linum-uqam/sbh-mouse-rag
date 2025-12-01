@@ -17,13 +17,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("dataset/data"),
+        default=Path("out/dataset/data"),
         help="Directory for PNG images (default: dataset/data).",
     )
     p.add_argument(
         "--csv-path",
         type=Path,
-        default=Path("dataset/dataset.csv"),
+        default=Path("out/dataset/dataset.csv"),
         help="Path to CSV file (default: dataset/dataset.csv).",
     )
 
