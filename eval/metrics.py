@@ -12,10 +12,11 @@ from index.search import SearchResult
 @dataclass(frozen=True)
 class SpatialError:
     """
-    Simple spatial error in voxel space.
+    Simple spatial error in voxel space, based on 3D centers.
 
-    We treat each slice/patch as a 3D point derived from:
-        p = normal_xyz_unit * depth_vox
+    We treat each slice/patch as a 3D point:
+        p_query = q_slice.center_xyz_vox
+        p_retr  = (center_x_vox, center_y_vox, center_z_vox) from metadata
 
     Fields
     ------
@@ -33,41 +34,39 @@ def compute_spatial_error(
     hit: SearchResult,
 ) -> SpatialError:
     """
-    Spatial error between query slice and retrieved patch.
+    Spatial error between query slice and retrieved patch, using 3D
+    centers in voxel space.
 
-    - Convert (normal, depth_vox) to a 3D point in voxel space:
-         p = normal_xyz_unit * depth_vox
-    - Return Euclidean distance between query and retrieved points.
+    - Query center:
+        q_slice.center_xyz_vox  (tuple of 3 floats)
+    - Retrieved center:
+        center_x_vox, center_y_vox, center_z_vox from hit.meta
 
-    NOTE
-    ----
-    This *intentionally* ignores in-slice crop location, rotation, etc.
-    It only cares about the underlying 3D position defined by axis + depth.
+    Returns Euclidean distance in voxels and its components.
     """
-    # Query 3D position
-    q_n = np.asarray(q_slice.normal_xyz_unit, dtype=np.float64)
-    q_depth = float(q_slice.depth_vox)
-    q_pos = q_n * q_depth  # shape (3,)
-
-    m = hit.meta
-
-    # Retrieved 3D position from metadata
+    # --- Query 3D center ---
     try:
-        r_n = np.asarray(
-            [
-                float(m["normal_x"]),
-                float(m["normal_y"]),
-                float(m["normal_z"]),
-            ],
-            dtype=np.float64,
-        )
-        r_depth = float(m["depth_vox"])
-    except (KeyError, TypeError, ValueError):
-        # Missing or invalid metadata → undefined spatial error
+        q_pos = np.asarray(q_slice.center_xyz_vox, dtype=np.float64)
+        if q_pos.shape != (3,):
+            raise ValueError("q_slice.center_xyz_vox must be a length-3 tuple.")
+    except Exception:
         nan = float("nan")
         return SpatialError(dist=nan, dx=nan, dy=nan, dz=nan)
 
-    r_pos = r_n * r_depth
+    # --- Retrieved 3D center from metadata ---
+    m = hit.meta
+    try:
+        r_pos = np.asarray(
+            [
+                float(m["center_x_vox"]),
+                float(m["center_y_vox"]),
+                float(m["center_z_vox"]),
+            ],
+            dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError):
+        nan = float("nan")
+        return SpatialError(dist=nan, dx=nan, dy=nan, dz=nan)
 
     diff = q_pos - r_pos
     dx, dy, dz = [float(d) for d in diff]
@@ -82,6 +81,9 @@ def compute_region_error(
 ) -> float:
     """
     Region-composition error between query and retrieved patches, using Allen labels.
+
+    This is an L1-style mismatch fraction in [0,1], i.e. approximate fraction of pixels
+    whose region label would have to change to make the two patches match.
 
     For both query and retrieved patch:
       - Flatten labels.

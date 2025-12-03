@@ -33,7 +33,7 @@ class Stats:
 
     # region error (per row, averaged over sources)
     rows_with_region: int = 0
-    _sum_region_mse: float = 0.0
+    _sum_region_l1_error: float = 0.0
 
     def update_row(
         self,
@@ -84,7 +84,7 @@ class Stats:
         ]
         if region_vals:
             self.rows_with_region += 1
-            self._sum_region_mse += float(sum(region_vals) / len(region_vals))
+            self._sum_region_l1_error += float(sum(region_vals) / len(region_vals))
 
     # --------- convenience properties ---------
     @property
@@ -125,10 +125,10 @@ class Stats:
         )
 
     @property
-    def avg_region_mse(self) -> float:
-        """Average region-composition error (0–1)."""
+    def avg_region_l1_error(self) -> float:
+        """Average region-composition error (L1 mismatch fraction in [0,1])."""
         return (
-            self._sum_region_mse / self.rows_with_region
+            self._sum_region_l1_error / self.rows_with_region
             if self.rows_with_region
             else float("nan")
         )

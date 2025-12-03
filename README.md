@@ -40,7 +40,7 @@ python -m scripts.search_index index/test/test.PNG --k 10 --save-dir out/search/
 ## Eval
 **Run searches**
 ```bash
-python -m scripts.run_eval   --csv out/dataset/dataset.csv   --source both   --save-dir out/eval/   --save-k 10 --final-k 100
+python -m scripts.run_eval   --csv out/dataset/dataset.csv   --source both   --save-dir out/eval/   --save-k 10 --final-k 10
 ```
 
 **Run the report script**

@@ -93,6 +93,9 @@ class PatchMeta:
     slice_size_px: int
     resolution_um: int
 
+    # patch center in voxel space (one logical field)
+    center_xyz_vox: tuple[float, float, float]
+
 # ----------------------------------------------------------------------
 # FAISS index manager
 # ----------------------------------------------------------------------
@@ -453,6 +456,17 @@ class PatchIndexBuilder:
 
                 patch = img[y0:y1, x0:x1]
 
+                # center in slice pixel coordinates
+                cx_px = (x0 + x1 - 1) / 2.0
+                cy_px = (y0 + y1 - 1) / 2.0
+
+                center_xyz = slc.pixel_to_voxel(cx_px, cy_px)
+                center_xyz_vox = (
+                    float(center_xyz[0]),
+                    float(center_xyz[1]),
+                    float(center_xyz[2]),
+                )
+
                 meta_patch = PatchMeta(
                     normal_idx=normal_idx,
                     depth_idx=depth_idx,
@@ -473,6 +487,7 @@ class PatchIndexBuilder:
                     patch_w=int(x1 - x0),
                     slice_size_px=int(slice_size),
                     resolution_um=int(self.sampling_cfg.resolution_um),
+                    center_xyz_vox=center_xyz_vox,
                 )
 
                 yield patch, meta_patch
@@ -533,6 +548,10 @@ class PatchIndexBuilder:
                     # global slice info
                     "slice_size_px": meta.slice_size_px,
                     "resolution_um": meta.resolution_um,
+                    # patch 3D center
+                    "center_x_vox": meta.center_xyz_vox[0],
+                    "center_y_vox": meta.center_xyz_vox[1],
+                    "center_z_vox": meta.center_xyz_vox[2],
                 }
             )
 

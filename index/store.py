@@ -155,6 +155,8 @@ class IndexStore:
           - depth_vox, rotation_deg
           - scale, patch_row, patch_col
           - x0, y0, x1, y1, patch_h, patch_w
+          - slice_size_px, resolution_um
+          - center_x_vox, center_y_vox, center_z_vox
         """
         row = self.row_for_id(pid)
 
@@ -178,6 +180,9 @@ class IndexStore:
             "patch_w",
             "slice_size_px",
             "resolution_um",
+            "center_x_vox",
+            "center_y_vox",
+            "center_z_vox",
         ]
 
         out = {}

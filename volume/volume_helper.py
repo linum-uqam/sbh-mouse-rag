@@ -15,6 +15,61 @@ def _compute_lo_hi(arr: np.ndarray, percentiles=(0.5, 99.5)) -> tuple[float, flo
     lo, hi = np.percentile(arr, percentiles)
     return float(lo), float(hi)
 
+def slice_pixel_to_voxel(
+    volume_shape_zyx: Tuple[int, int, int],
+    normal_xyz_unit: Tuple[float, float, float],
+    depth_vox: float,
+    rotation_deg: float,
+    plane_size_px: int,
+    pixel_step_vox: float,
+    x_px: float,
+    y_px: float,
+) -> np.ndarray:
+    """
+    Map a pixel (x_px, y_px) in a slice plane to a 3D voxel coordinate (X,Y,Z).
+
+    The slice plane is defined by:
+      - normal_xyz_unit: unit normal (X,Y,Z)
+      - depth_vox      : signed distance along normal from volume center
+      - rotation_deg   : in-plane rotation around normal
+      - plane_size_px  : side length (in pixels) of the sampling plane
+      - pixel_step_vox : voxel step per pixel in the plane
+
+    volume_shape_zyx is (Z, Y, X).
+    """
+    Z, Y, X = volume_shape_zyx
+
+    # normal in XYZ, unit norm
+    n = np.asarray(normal_xyz_unit, dtype=np.float64)
+    n_norm = np.linalg.norm(n)
+    n = n / (n_norm + 1e-12)
+
+    # build orthonormal basis {u, v, n} in voxel (X,Y,Z) space
+    ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = ref - np.dot(ref, n) * n
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+
+    # apply in-plane rotation
+    th = math.radians(rotation_deg)
+    u_r =  math.cos(th) * u + math.sin(th) * v
+    v_r = -math.sin(th) * u + math.cos(th) * v
+
+    # center of volume in XYZ
+    center_xyz = np.array(
+        [(X - 1) / 2.0, (Y - 1) / 2.0, (Z - 1) / 2.0],
+        dtype=np.float64,
+    )
+
+    # offsets along u_r, v_r from slice center
+    half = (plane_size_px - 1) / 2.0
+    su = (x_px - half) * float(pixel_step_vox)
+    sv = (y_px - half) * float(pixel_step_vox)
+
+    # final point in XYZ
+    P_xyz = center_xyz + depth_vox * n + su * u_r + sv * v_r
+    return P_xyz  # (X, Y, Z)
+
 # -------------------- Slice object --------------------
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +81,25 @@ class Slice:
     pixel_step_vox: float
     size_px: int
     volume_shape_zyx: Tuple[int, int, int]
+    # 3D center of this slice/crop in voxel coordinates (X, Y, Z)
+    center_xyz_vox: Tuple[float, float, float] 
     labels: Optional[np.ndarray] = None       # (H,W) int32, 0=background; None if absent
+
+    def pixel_to_voxel(self, x_px: float, y_px: float) -> Tuple[float, float, float]:
+        """
+        Map a point in slice pixel coordinates (x_px, y_px) to 3D voxel
+        coordinates in the parent volume, using this slice's pose.
+        """
+        return slice_pixel_to_voxel(
+            volume_shape_zyx=self.volume_shape_zyx,
+            normal_xyz_unit=self.normal_xyz_unit,
+            depth_vox=float(self.depth_vox),
+            rotation_deg=float(self.rotation_deg),
+            plane_size_px=int(self.size_px),
+            pixel_step_vox=float(self.pixel_step_vox),
+            x_px=float(x_px),
+            y_px=float(y_px),
+        )
 
     # ---------- I/O ----------
     def save(
@@ -81,11 +154,15 @@ class Slice:
     ) -> "Slice":
         """
         Deterministic crop using normalized args; crops image and labels (if present).
+
+        The 3D center of the new Slice is computed as the 3D position of the
+        crop center in the SAME slice plane as the parent.
         """
         H, W = self.image.shape
         w = max(1, int(round(W * rw)))
         h = max(1, int(round(H * rh)))
 
+        # crop center in *current slice image* coordinates
         x_center = int(round(cx * (W - 1)))
         y_center = int(round(cy * (H - 1)))
         x0 = x_center - w // 2
@@ -99,16 +176,34 @@ class Slice:
             x1 = max(0, min(x1, W))
             y1 = max(0, min(y1, H))
             if x1 <= x0 or y1 <= y0:
-                x0, y0 = min(W-1, x0), min(H-1, y0)
-                x1, y1 = min(W, x0+1), min(H, y0+1)
+                x0, y0 = min(W - 1, x0), min(H - 1, y0)
+                x1, y1 = min(W, x0 + 1), min(H, y0 + 1)
         else:
             if not (0 <= x0 < x1 <= W and 0 <= y0 < y1 <= H):
                 raise ValueError("Crop window is out of bounds and clamp=False.")
+
+        # recompute center after possible clamp
+        w = x1 - x0
+        h = y1 - y0
+        x_center = x0 + w // 2
+        y_center = y0 + h // 2
 
         img_sub = self.image[y0:y1, x0:x1]
         labels_sub = None
         if self.labels is not None:
             labels_sub = self.labels[y0:y1, x0:x1].copy()
+
+        # --- 3D center from shared helper ---
+        center_xyz = slice_pixel_to_voxel(
+            volume_shape_zyx=self.volume_shape_zyx,
+            normal_xyz_unit=self.normal_xyz_unit,
+            depth_vox=self.depth_vox,
+            rotation_deg=self.rotation_deg,
+            plane_size_px=self.size_px,             # plane size = original sampling size
+            pixel_step_vox=self.pixel_step_vox,
+            x_px=float(x_center),
+            y_px=float(y_center),
+        )
 
         return Slice(
             image=img_sub.copy(),
@@ -116,8 +211,9 @@ class Slice:
             depth_vox=self.depth_vox,
             rotation_deg=self.rotation_deg,
             pixel_step_vox=self.pixel_step_vox,
-            size_px=min(img_sub.shape[0], img_sub.shape[1]),
+            size_px=self.size_px,                   # keep plane size, not crop size
             volume_shape_zyx=self.volume_shape_zyx,
+            center_xyz_vox=(float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2])),
             labels=labels_sub,
         )
     
@@ -141,8 +237,9 @@ class Slice:
             depth_vox=self.depth_vox,
             rotation_deg=self.rotation_deg,
             pixel_step_vox=self.pixel_step_vox,
-            size_px=self.size_px,
+            size_px=self.size_px,               # plane size unchanged
             volume_shape_zyx=self.volume_shape_zyx,
+            center_xyz_vox=self.center_xyz_vox, # same 3D center
             labels=(None if self.labels is None else self.labels.copy()),
         )
 
@@ -369,14 +466,37 @@ class VolumeHelper:
             elif annotation_helper is not None:
                 labels = annotation_helper.sample_labels(coords)
 
-        return Slice(
-            image=img,
-            normal_xyz_unit=tuple(self._unit(n).tolist()),
+        volume_shape_zyx = (Z, Y, X)
+        n_unit = tuple(self._unit(n).tolist())
+        plane_size_px = int(size)
+        pixel_step_vox = float(pixel)
+
+        # center of full slice = middle pixel of the plane
+        half = (plane_size_px - 1) / 2.0
+        center_xyz = slice_pixel_to_voxel(
+            volume_shape_zyx=volume_shape_zyx,
+            normal_xyz_unit=n_unit,
             depth_vox=float(depth),
             rotation_deg=float(rotation),
-            pixel_step_vox=float(pixel),
-            size_px=int(size),
-            volume_shape_zyx=(Z, Y, X),
+            plane_size_px=plane_size_px,
+            pixel_step_vox=pixel_step_vox,
+            x_px=half,
+            y_px=half,
+        )
+
+        return Slice(
+            image=img,
+            normal_xyz_unit=n_unit,
+            depth_vox=float(depth),
+            rotation_deg=float(rotation),
+            pixel_step_vox=pixel_step_vox,
+            size_px=plane_size_px,   # plane side length
+            volume_shape_zyx=volume_shape_zyx,
+            center_xyz_vox=(
+                float(center_xyz[0]),
+                float(center_xyz[1]),
+                float(center_xyz[2]),
+            ),
             labels=labels,
         )
 

@@ -202,10 +202,9 @@ class Evaluator:
 
             pbar.set_postfix({
                 "top1": f"{self.stats.avg_top1:7.4f}",
-                # Show average pure query latency per search (allen+real mixed)
                 "lat": f"{self.stats.avg_query_latency_ms:6.0f}ms",
                 "sp_err": f"{self.stats.avg_spatial_dist:7.2f}",
-                "reg_mse": f"{self.stats.avg_region_mse * 100:6.2f}%",  # % mismatch
+                "reg_l1": f"{self.stats.avg_region_l1_error * 100:6.2f}%",  # % mismatch
             })
             pbar.update(1)
 
@@ -333,7 +332,7 @@ class Evaluator:
         print(
             f"  spatial_dist={se.dist:.3f} vox  "
             f"d=({se.dx:.1f},{se.dy:.1f},{se.dz:.1f})  "
-            f"region_mse={re:.3f}"
+            f"region_l1_error={re:.3f}"
         )
 
         N = min(5, len(hits))
@@ -374,8 +373,8 @@ class Evaluator:
             )
         if s.rows_with_region:
             print(
-                f"Avg region mismatch: {s.avg_region_mse * 100:.2f}% "
-                f"(region-pixel mismatch)"
+                f"Avg region mismatch: {s.avg_region_l1_error * 100:.2f}% "
+                f"(region-pixel mismatch, L1)"
             )
 
     def _record_hits(
@@ -394,7 +393,7 @@ class Evaluator:
 
         Metrics stored:
           - spatial_dist_vox, spatial_dist_um, dx, dy, dz
-          - region_mse
+          - region_l1_error  (fraction of pixels with mismatched region)
         """
         qnx, qny, qnz = sl.normal_xyz_unit
         q_depth = float(sl.depth_vox)
@@ -462,7 +461,7 @@ class Evaluator:
                 "spatial_dy_vox": se.dy,
                 "spatial_dz_vox": se.dz,
                 # region metric (for this rank)
-                "region_mse": re,
+                "region_l1_error": re,
             }
 
             self._records.append(rec)
