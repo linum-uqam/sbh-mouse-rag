@@ -13,7 +13,7 @@ from index.store import IndexStore
 from index.model.dino import model
 from index.utils import log
 from index.config import SLICE_SIZE
-
+from index.reranker.runtime import RerankerRuntimeConfig, RerankerService
 
 @dataclass
 class SearchConfig:
@@ -27,6 +27,13 @@ class SearchConfig:
     min_fg_ratio: float = 0.05     # if less than this, skip cropping
     verbose: bool = True           # control logging (e.g. auto-crop log)
 
+    # --- optional neural reranker (embedding-only) ---
+    use_reranker: bool = False
+    rerank_topk: int = 10
+    reranker_model_path: Path = Path("out/reranker/reranker.pt")
+    reranker_device: str = "cuda"
+    reranker_batch_size: int = 32
+
 
 @dataclass
 class SearchResult:
@@ -37,6 +44,7 @@ class SearchResult:
     score: float
     angle: float  # query rotation angle that produced this score
     meta: Dict[str, Any]  # manifest row as dict
+    rerank_score: float | None = None  # optional reranker score
 
 
 class SliceSearcher:
@@ -46,12 +54,22 @@ class SliceSearcher:
     Typical usage:
         store = IndexStore().load_all()
         searcher = SliceSearcher(store)
-        hits = searcher.search_image(img_np, k=10)
+        hits, q = searcher.search_image(img_np, k=10)
     """
 
     def __init__(self, store: IndexStore, cfg: SearchConfig | None = None):
         self.store = store
         self.cfg = cfg or SearchConfig()
+
+        # Lazy-initialized reranker
+        self.reranker: RerankerService | None = None
+        if self.cfg.use_reranker:
+            rr_cfg = RerankerRuntimeConfig(
+                model_path=self.cfg.reranker_model_path,
+                device=self.cfg.reranker_device,
+                batch_size=self.cfg.reranker_batch_size,
+            )
+            self.reranker = RerankerService(rr_cfg)
 
     # ------------------------------------------------------------------
     # Public API
@@ -122,6 +140,53 @@ class SliceSearcher:
                 )
             )
 
+        # 7) Optional neural reranking (embedding-only, per-angle)
+        if self.cfg.use_reranker and self.reranker is not None and results:
+            # Map angle value -> index in G
+            # (Use nearest match to be robust to small float differences.)
+            angle_list = [float(a) for a in angles]
+
+            def _angle_to_idx(a_val: float) -> int:
+                return int(
+                    min(range(len(angle_list)), key=lambda i: abs(angle_list[i] - float(a_val)))
+                )
+
+            # Candidate embeddings from sidecar matrix, aligned with `results`
+            ids_for_rerank = [h.patch_id for h in results]
+            cand_embs = self.store.vectors_for_ids(ids_for_rerank)  # (N,D)
+
+            N = len(results)
+            topk = max(1, min(self.cfg.rerank_topk, N))
+
+            top_hits = results[:topk]
+            top_cand_embs = cand_embs[:topk]  # (topk, D)
+            rest_hits = results[topk:]
+
+            # Build per-hit query embeddings based on each hit's best angle
+            D = top_cand_embs.shape[1]
+            q_embs = np.zeros((topk, D), dtype=np.float32)
+            for i, h in enumerate(top_hits):
+                a_idx = _angle_to_idx(h.angle)
+                q_embs[i] = G[a_idx]
+
+            # Get reranker scores (per-candidate query embedding)
+            scores = self.reranker.score_emb_pairs(q_embs, top_cand_embs)
+
+            for h, s in zip(top_hits, scores):
+                h.rerank_score = float(s)
+
+            # Sort by rerank_score desc; tie-breaker: original coarse score
+            top_hits_sorted = sorted(
+                top_hits,
+                key=lambda h: (
+                    h.rerank_score if h.rerank_score is not None else -1e9,
+                    h.score,
+                ),
+                reverse=True,
+            )
+
+            results = top_hits_sorted + rest_hits
+
         return results, q
 
     def to_dataframe(self, hits: List[SearchResult]) -> pd.DataFrame:
@@ -134,6 +199,8 @@ class SliceSearcher:
             row["patch_id"] = h.patch_id
             row["score"] = h.score
             row["query_angle_deg"] = h.angle
+            if h.rerank_score is not None:
+                row["rerank_score"] = h.rerank_score
             rows.append(row)
         return pd.DataFrame(rows)
 

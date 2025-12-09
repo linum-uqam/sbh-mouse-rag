@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--final-k",
         type=int,
-        default=10,
+        default=100,
         help="Top-k patches to keep per query.",
     )
     p.add_argument(
@@ -118,6 +118,38 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Verbose logging of per-row hits.",
+    )
+
+    # --- Reranker (optional) ---
+    p.add_argument(
+        "--use-reranker",
+        action="store_true",
+        default=False,
+        help="Enable neural reranker on top of coarse FAISS search.",
+    )
+    p.add_argument(
+        "--rerank-topk",
+        type=int,
+        default=None,
+        help="Only rerank the top-K coarse hits (default: use final_k).",
+    )
+    p.add_argument(
+        "--reranker-model-path",
+        type=str,
+        default="out/reranker/reranker.pt",
+        help="Path to trained reranker .pt file.",
+    )
+    p.add_argument(
+        "--reranker-device",
+        type=str,
+        default="cuda",
+        help='Device for reranker inference ("cuda" or "cpu").',
+    )
+    p.add_argument(
+        "--reranker-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for reranker scoring.",
     )
 
     # Output
@@ -147,6 +179,9 @@ def main() -> None:
     faiss.omp_set_num_threads(max(1, mp.cpu_count() - 1))
     a = parse_args()
 
+    # If user didn't specify rerank_topk, tie it to final_k by default.
+    rerank_topk = a.rerank_topk if a.rerank_topk is not None else a.final_k
+
     cfg = EvalConfig(
         csv_path=Path(a.csv),
         source=a.source,
@@ -166,6 +201,12 @@ def main() -> None:
         save_dir=Path(a.save_dir) if a.save_dir else None,
         save_k=a.save_k,
         save_seed=a.save_seed,
+        # --- reranker bits ---
+        use_reranker=a.use_reranker,
+        rerank_topk=rerank_topk,
+        reranker_model_path=Path(a.reranker_model_path),
+        reranker_device=a.reranker_device,
+        reranker_batch_size=a.reranker_batch_size,
     )
 
     Evaluator(cfg).run()

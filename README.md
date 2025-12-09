@@ -29,24 +29,73 @@ python -m scripts.create_index --k-normals 16 --slice-size 512 --patch-scales 1 
 
 **With a whole slice**
 ```bash
+# Base search (only faiss cosine similarity)
 python -m scripts.search_index out/dataset/data/00044_a.png --k 10 --save-dir out/search/00044_a
+
+# With re-ranker (using MLP on embedding as reranker)
+python -m scripts.search_index out/dataset/data/00044_a.png \
+  --save-dir out/search/00044_a_rerank \
+  --k 50 \
+  --use-reranker \
+  --rerank-topk 50
 ```
 
 **With a crop slice**
 ```bash
 python -m scripts.search_index index/test/test.PNG --k 10 --save-dir out/search/test
+python -m scripts.search_index index/test/test.PNG \
+  --save-dir out/search/test_rerank \
+  --k 50 \
+  --use-reranker \
+  --rerank-topk 50
 ```
 
 ## Eval
 **Run searches**
 ```bash
-python -m scripts.run_eval   --csv out/dataset/dataset.csv   --source both   --save-dir out/eval/   --save-k 10 --final-k 10
+# Baseline
+python -m scripts.run_eval \
+  --csv out/dataset/dataset.csv \
+  --source both \
+  --final-k 10 \
+  --k-per-angle 64 \
+  --save-dir out/eval/base \
+  --save-k 3
+
+# With reranker
+python -m scripts.run_eval \
+  --csv out/dataset/dataset.csv \
+  --source both \
+  --final-k 100 \
+  --k-per-angle 64 \
+  --save-dir out/eval/rerank \
+  --use-reranker \
+  --rerank-topk 100 \
+  --reranker-model-path out/reranker/reranker.pt \
+  --reranker-device cuda \
+  --save-k 10
 ```
 
 **Run the report script**
 ```bash
 python -m scripts.run_report --csv out/eval/eval_hits.csv
+python -m scripts.run_report --csv out/eval/rerank/eval_hits.csv
 ```
+
+**Train re-ranker**
+```bash
+python -m scripts.train_reranker \
+    --data-mode volume \
+    --allen-cache-dir volume/data/allen \
+    --allen-resolution 25 \
+    --real-nifti volume/data/real/registered_brain_25um.nii.gz \
+    --n-samples 50000 \
+    --slice-size 224 \
+    --epochs 20 \
+    --batch-size 32 \
+    --device cuda
+```
+
 
 ## Paper 
 

@@ -561,7 +561,7 @@ class PatchIndexBuilder:
 
     # ---------- main build ----------
 
-    def build(self) -> Tuple[faiss.Index, pd.DataFrame]:
+    def build(self) -> Tuple[faiss.Index, pd.DataFrame, np.ndarray]:
         """
         Run the full pipeline in-memory. Does NOT write to disk.
         """
@@ -649,7 +649,7 @@ class PatchIndexBuilder:
 
         index = self.index_manager.build_index(X, I)
         df = pd.DataFrame(rows)
-        return index, df
+        return index, df, X
 
     # ---------- save & run helpers ----------
 
@@ -657,25 +657,33 @@ class PatchIndexBuilder:
     def save(
         index: faiss.Index,
         df: pd.DataFrame,
+        vectors: np.ndarray,
         out_dir: Path,
         *,
         index_name: str = "patch_index.faiss",
         manifest_name: str = "patch_manifest.parquet",
+        vectors_name: str = "patch_vectors.npy",
     ) -> Tuple[Path, Path]:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         index_path = out_dir / index_name
         manifest_path = out_dir / manifest_name
+        vectors_path = out_dir / vectors_name
 
         faiss.write_index(index, str(index_path))
         df.to_parquet(manifest_path, index=False)
 
+        # save embedding matrix
+        np.save(vectors_path, vectors.astype(np.float32, copy=False))
+
         log("index", [
-            "Saved index & manifest",
+            "Saved index, manifest & vectors",
             f"Index path   : {index_path}",
             f"Manifest     : {manifest_path}",
+            f"Vectors      : {vectors_path}",
             f"# rows       : {len(df)}",
+            f"Vectors shape: {vectors.shape}",
         ])
         return index_path, manifest_path
 
@@ -689,5 +697,12 @@ class PatchIndexBuilder:
         """
         Full pipeline: build in memory, then write to disk.
         """
-        index, df = self.build()
-        return self.save(index, df, out_dir, index_name=index_name, manifest_name=manifest_name)
+        index, df, X = self.build()
+        return self.save(
+            index,
+            df,
+            X,
+            out_dir,
+            index_name=index_name,
+            manifest_name=manifest_name,
+        )

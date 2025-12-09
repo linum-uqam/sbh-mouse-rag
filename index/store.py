@@ -20,14 +20,16 @@ class IndexStore:
     Simple storage layer for the *patch-based* index.
 
     - Loads:
-        - patch_index.faiss      (single FAISS index with all patch embeddings)
-        - patch_manifest.parquet (one row per patch, id as index)
+        - patch_index.faiss       (FAISS index with all patch embeddings)
+        - patch_manifest.parquet  (one row per patch, id as index)
+        - patch_vectors.npy       (optional: full (N,D) embedding matrix)
 
     - Provides:
         - .index      -> faiss.Index
         - .manifest   -> pd.DataFrame (indexed by patch id)
         - .search(Q,k)-> (D, I) with cosine / IP
         - helpers to fetch metadata for specific ids
+        - vectors_for_ids(ids) -> (len(ids), D) np.ndarray
     """
 
     def __init__(
@@ -36,13 +38,16 @@ class IndexStore:
         *,
         index_name: str = "patch_index.faiss",
         manifest_name: str = "patch_manifest.parquet",
+        vectors_name: str = "patch_vectors.npy",
     ):
         self.root = Path(root)
         self.index_name = index_name
         self.manifest_name = manifest_name
+        self.vectors_name = vectors_name
 
         self._index: Optional[faiss.Index] = None
         self._manifest_df: Optional[pd.DataFrame] = None
+        self._vectors: Optional[np.ndarray] = None  # (N,D) or None
 
     # ------------------------------------------------------------------
     # Loaders
@@ -50,10 +55,11 @@ class IndexStore:
 
     def load_all(self) -> "IndexStore":
         """
-        Load FAISS index + manifest from disk.
+        Load FAISS index + manifest (and optionally vectors) from disk.
         """
         index_path = self.root / self.index_name
         manifest_path = self.root / self.manifest_name
+        vectors_path = self.root / self.vectors_name
 
         self._index = self._load_faiss(index_path)
         df = self._read_parquet(manifest_path)
@@ -63,6 +69,13 @@ class IndexStore:
             df = df.set_index("id")
 
         self._manifest_df = df
+
+        # Optional: load vectors sidecar if present
+        if vectors_path.exists():
+            self._vectors = np.load(vectors_path)
+        else:
+            self._vectors = None
+
         return self
 
     # ------------------------------------------------------------------
@@ -148,15 +161,6 @@ class IndexStore:
     def pose_for_id(self, pid: int) -> Dict:
         """
         Convenience: extract 3D pose + patch box for a given patch id.
-
-        Returns a dict with keys:
-          - normal_idx, depth_idx, rot_idx
-          - normal_x, normal_y, normal_z
-          - depth_vox, rotation_deg
-          - scale, patch_row, patch_col
-          - x0, y0, x1, y1, patch_h, patch_w
-          - slice_size_px, resolution_um
-          - center_x_vox, center_y_vox, center_z_vox
         """
         row = self.row_for_id(pid)
 
@@ -190,6 +194,33 @@ class IndexStore:
             if k in row:
                 out[k] = row[k]
         return out
+
+    # ------------------------------------------------------------------
+    # Vector helpers for reranker
+    # ------------------------------------------------------------------
+
+    def vectors_for_ids(self, ids: Iterable[int]) -> np.ndarray:
+        """
+        Return embedding vectors for given patch ids.
+
+        Preferred path:
+          - if a sidecar matrix (patch_vectors.npy) is loaded, index into it.
+        """
+        ids_list = [int(i) for i in ids]
+
+        # 1) If we have a sidecar matrix, use that (fast + reliable).
+        if self._vectors is not None:
+            vecs = self._vectors
+            if vecs.ndim != 2:
+                raise RuntimeError(
+                    f"Loaded vectors have invalid shape: {vecs.shape}, expected (N,D)"
+                )
+            try:
+                return vecs[ids_list]
+            except IndexError as e:
+                raise IndexError(
+                    f"Some requested ids are out of range for vectors sidecar: {e}"
+                )
 
     # ------------------------------------------------------------------
     # Low-level I/O

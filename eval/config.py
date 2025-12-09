@@ -41,8 +41,15 @@ class EvalConfig:
     crop_foreground: bool = True
     debug: bool = False
 
+    # -------- Reranker (optional) --------
+    use_reranker: bool = False
+    rerank_topk: Optional[int] = None
+    reranker_model_path: Path = Path("out/reranker/reranker.pt")
+    reranker_device: str = "cuda"
+    reranker_batch_size: int = 32
+
     # -------- Output --------
-    save_dir: Path = Path("out/eval") 
+    save_dir: Path = Path("out/eval")
     save_k: Optional[int] = None
     save_seed: int = 42
 

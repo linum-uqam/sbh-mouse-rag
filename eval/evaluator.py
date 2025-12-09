@@ -25,6 +25,7 @@ from eval.metrics import (
 from eval.config import EvalConfig
 from eval.stats import Stats
 
+
 class Evaluator:
     def __init__(self, cfg: EvalConfig) -> None:
         self.cfg = cfg
@@ -32,11 +33,18 @@ class Evaluator:
         # --- build deps once ---
         self.store = IndexStore().load_all()
 
+        # pass reranker-related flags into SearchConfig (SliceSearcher handles it)
         self.search_cfg = SearchConfig(
             angles=self.cfg.angles,
             k_per_angle=self.cfg.k_per_angle,
             crop_foreground=self.cfg.crop_foreground,
             verbose=self.cfg.debug,
+            # reranker options (optional – SearchConfig must support these)
+            use_reranker=self.cfg.use_reranker,
+            rerank_topk=self.cfg.rerank_topk,
+            reranker_model_path=self.cfg.reranker_model_path,
+            reranker_device=self.cfg.reranker_device,
+            reranker_batch_size=self.cfg.reranker_batch_size,
         )
         self.searcher = SliceSearcher(self.store, cfg=self.search_cfg)
 
@@ -104,7 +112,7 @@ class Evaluator:
     def debug(self) -> bool:
         return self.cfg.debug
 
-        # ---------------- public API ----------------
+    # ---------------- public API ----------------
     def run(self) -> None:
         total = self._rows_to_process
         pbar = tqdm(total=total, desc="Eval", unit="row")
@@ -217,7 +225,6 @@ class Evaluator:
             df.to_csv(self.results_csv_path, index=False)
             print(f"Detailed results CSV saved to: {self.results_csv_path}")
 
-
     # ---------------- internals ----------------
     def _compute_rows_to_process(self) -> int:
         """How many dataset rows should we actually evaluate?"""
@@ -237,7 +244,7 @@ class Evaluator:
         k = min(k, rows_to_process)
         rng = random.Random(self.cfg.save_seed)
         return set(rng.sample(range(rows_to_process), k))
-    
+
     def _source_list(self, sample: Dict[str, Any]) -> List[Tuple[str, Slice]]:
         source = self.cfg.source
         allen_sl: Slice = sample["allen"]
@@ -347,11 +354,17 @@ class Evaluator:
                 f"{rank:02d} pid={h.patch_id}",
                 f"score={h.score:.4f}",
                 f"q_angle={h.angle:5.1f}°",
+            ]
+            # add rerank score if present
+            if getattr(h, "rerank_score", None) is not None:
+                cols.append(f"rerank={h.rerank_score:.4f}")
+
+            cols.extend([
                 f"n=({n[0]:+.3f},{n[1]:+.3f},{n[2]:+.3f})",
                 f"depth={m.get('depth_vox', float('nan')):.1f}",
                 f"scale={m.get('scale', '?')}",
                 f"box=({m.get('x0','?')},{m.get('y0','?')})-({m.get('x1','?')},{m.get('y1','?')})",
-            ]
+            ])
             print("  " + "  ".join(cols))
 
     def _print_summary(self) -> None:
@@ -394,6 +407,7 @@ class Evaluator:
         Metrics stored:
           - spatial_dist_vox, spatial_dist_um, dx, dy, dz
           - region_l1_error  (fraction of pixels with mismatched region)
+          - rerank_score     (if reranker was active)
         """
         qnx, qny, qnz = sl.normal_xyz_unit
         q_depth = float(sl.depth_vox)
@@ -428,6 +442,8 @@ class Evaluator:
                 "patch_id": h.patch_id,
                 "score": h.score,
                 "query_angle_deg": h.angle,
+                # reranker score (may be None if reranker is disabled)
+                "rerank_score": getattr(h, "rerank_score", None),
                 # query pose
                 "q_normal_x": float(qnx),
                 "q_normal_y": float(qny),

@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 from index.store import IndexStore
 from index.search import SliceSearcher, SearchConfig
 from index.utils import log, load_image_gray
 from index.config import OUT_DIR
 from index.vis import save_search_results_visuals
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -57,8 +59,39 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="If set, save visualizations of the top-k hits into this directory.",
     )
+    parser.add_argument(
+        "--use-reranker",
+        action="store_true",
+        help="If set, apply neural reranker on the top-k results.",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        type=Path,
+        default=Path("out/reranker/reranker.pt"),
+        help="Path to trained reranker model (default: out/reranker/reranker.pt).",
+    )
+    parser.add_argument(
+        "--rerank-topk",
+        type=int,
+        default=10,
+        help="How many of the coarse hits to rerank (default: 10).",
+    )
 
     return parser.parse_args()
+
+
+def _load_candidate_image_from_meta(meta: dict) -> np.ndarray:
+    """
+    Example: load candidate patch from PNG path in meta["png_path"].
+
+    You can replace this with any logic you want (e.g., reconstruct from volume).
+    """
+    p = Path(meta["png_path"])
+    img = Image.open(p).convert("L")
+    arr = np.array(img, dtype=np.float32)
+    if arr.max() > 1.0:
+        arr = arr / 255.0
+    return arr
 
 
 def main() -> None:
@@ -73,6 +106,7 @@ def main() -> None:
         f"Auto-crop     : {not args.no_crop}",
         f"Index root    : {args.index_root}",
         f"Save dir      : {args.save_dir}",
+        f"Use reranker  : {args.use_reranker}",
     ])
 
     # 1) Load store (index + manifest)
@@ -83,16 +117,17 @@ def main() -> None:
         angles=tuple(float(a) for a in args.angles),
         k_per_angle=int(args.k_per_angle),
         crop_foreground=not args.no_crop,
+        use_reranker=args.use_reranker,
+        rerank_topk=args.rerank_topk,
+        reranker_model_path=args.reranker_model,
+        reranker_device="cuda",       # or make this a CLI arg if you want
+        reranker_batch_size=32,
     )
 
-    # 3) Create searcher and run (getting hits + query image)
+    # 3) Create searcher and run (getting hits + preprocessed query image)
     searcher = SliceSearcher(store, cfg=cfg)
     img = load_image_gray(args.image)
     hits, query_img = searcher.search_image(img, k=args.k)
-
-    if not hits:
-        log("search", ["No results found."])
-        return
 
     df = searcher.to_dataframe(hits)
 
@@ -111,14 +146,15 @@ def main() -> None:
         )
         depth_vox = m.get("depth_vox", "?")
         rotation_deg = m.get("rotation_deg", "?")
+        extra = f" rerank={h.rerank_score:.4f}" if h.rerank_score is not None else ""
 
         log("search", [
-            f"[{i:02d}] score={h.score:.4f} ",
+            f"[{i:02d}] score={h.score:.4f}{extra} ",
             f"(query_angle={h.angle:.1f}°, patch_id={h.patch_id}) ",
             f"normal={normal_idx} depth={depth_idx} scale={scale} ",
             f"box=({x0},{y0})-({x1},{y1}) depth_vox={depth_vox:.3f} rot_deg={rotation_deg:.1f}"
         ])
-        
+
     # 4) Optionally save visuals
     if args.save_dir is not None:
         save_search_results_visuals(hits, query_img, args.save_dir)
@@ -129,6 +165,7 @@ def main() -> None:
         csv_path = save_dir / "search_results.csv"
         df.to_csv(csv_path, index=False)
         log("search", [f"Saved CSV results to: {csv_path}"])
+
 
 if __name__ == "__main__":
     main()
