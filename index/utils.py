@@ -14,7 +14,8 @@ def log(title: str, lines: Iterable[str] | None = None) -> None:
       log("slices", ["Saved: path/to/file"])
       log("step", None)  # just a header line
     """
-    print(f"\n[{title}]")
+    if title and len(title)!=0 : 
+        print(f"\n[{title}]")
     if lines is None:
         return
     for s in lines:

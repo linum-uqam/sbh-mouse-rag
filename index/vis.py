@@ -4,6 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
+import matplotlib
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import numpy as np

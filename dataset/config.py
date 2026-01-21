@@ -26,7 +26,7 @@ class DatasetConfig:
     slice_size: int = 512
 
     # Crops per plane
-    max_crop_attempts: int = 4
+    max_crop_attempts: int = 50
     min_crop_frac: float = 0.3  # min relative crop size
     max_crop_frac: float = 0.7  # max relative crop size
 

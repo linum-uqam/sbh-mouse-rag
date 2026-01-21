@@ -1,4 +1,4 @@
-# scripts/create_dataset.py
+# scripts/create_reranker_dataset.py
 from __future__ import annotations
 
 import argparse
@@ -10,21 +10,24 @@ from dataset import DatasetConfig, MouseBrainDatasetBuilder
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Create Allen/real dataset with full slices + random crops."
+        description=(
+            "Create Allen/real dataset (full slices + random crops) "
+            "for reranker training/validation."
+        )
     )
 
-    # Output
+    # Output (different defaults from eval dataset)
     p.add_argument(
         "--out-dir",
         type=Path,
-        default=Path("out/dataset/data"),
-        help="Directory for PNG images (default: dataset/data).",
+        default=Path("out/reranker_dataset/data"),
+        help="Directory for PNG images (default: out/reranker_dataset/data).",
     )
     p.add_argument(
         "--csv-path",
         type=Path,
-        default=Path("out/dataset/dataset.csv"),
-        help="Path to CSV file (default: dataset/dataset.csv).",
+        default=Path("out/reranker_dataset/dataset.csv"),
+        help="Path to CSV file (default: out/reranker_dataset/dataset.csv).",
     )
 
     # Volumes
@@ -51,8 +54,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num-slices",
         type=int,
-        default=100,
-        help="Total number of dataset rows (full + crops).",
+        default=1000,
+        help=(
+            "Total number of dataset rows (full + crops). "
+            "Use a larger value (e.g. 5000–20000) for reranker training."
+        ),
     )
     p.add_argument(
         "--slice-size",
@@ -90,8 +96,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed.",
+        default=123,  # different default from eval to reduce overlap
+        help="Random seed (use a different seed than the eval dataset).",
     )
 
     return p.parse_args()
@@ -114,10 +120,8 @@ def main() -> None:
         save_images=not args.no_save_images,
         seed=args.seed,
     )
-
     builder = MouseBrainDatasetBuilder(cfg)
     builder.run()
-
 
 if __name__ == "__main__":
     main()

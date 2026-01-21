@@ -11,7 +11,6 @@ uv sync
 ## Volume
 ```bash
 python -m scripts.volume_usage
-
 ```
 
 ## Dataset
@@ -21,8 +20,7 @@ python -m scripts.create_dataset
 
 ## Index
 ```bash
-python -m scripts.create_index
-python -m scripts.create_index --k-normals 16 --slice-size 512 --patch-scales 1 2 4 8 --patch-overlap 0.5 --out-dir dino_16_1-2-4-8_05
+python -m scripts.create_index # --k-normals 16 --slice-size 512 --patch-scales 1 2 4 --patch-overlap 0.25
 ```
 
 ## Search
@@ -30,38 +28,84 @@ python -m scripts.create_index --k-normals 16 --slice-size 512 --patch-scales 1 
 **With a whole slice**
 ```bash
 # Base search (only faiss cosine similarity)
-python -m scripts.search_index out/dataset/data/00044_a.png --k 10 --save-dir out/search/00044_a
-
-# With re-ranker (using MLP on embedding as reranker)
-python -m scripts.search_index out/dataset/data/00044_a.png \
-  --save-dir out/search/00044_a_rerank \
-  --k 50 \
-  --use-reranker \
-  --rerank-topk 50
-```
-
-**With a crop slice**
-```bash
-python -m scripts.search_index index/test/test.PNG --k 10 --save-dir out/search/test
-python -m scripts.search_index index/test/test.PNG \
-  --save-dir out/search/test_rerank \
-  --k 50 \
-  --use-reranker \
-  --rerank-topk 50
+python -m scripts.search_index \
+  out/dataset/data/00005_a_crop1.png \
+  --k 20 \
+  --k-per-angle 64 \
+  --save-dir out/search/baseline
 ```
 
 ## Eval
-**Run searches**
+**Run eval**
 ```bash
 # Baseline
 python -m scripts.run_eval \
   --csv out/dataset/dataset.csv \
   --source both \
-  --final-k 10 \
+  --final-k 100 \
   --k-per-angle 64 \
   --save-dir out/eval/base \
-  --save-k 3
+  --save-k 3 \
+  --distance-grid 32 \
+  --distance-trim 0.05
+```
 
+**Run the report script**
+```bash
+python -m scripts.run_report --csv out/eval/base/eval_hits.csv
+```
+
+## Re-ranker
+
+**Build a training dataset**
+```bash
+python -m scripts.create_reranker_dataset \
+  --num-slices 1000 \
+  --out-dir out/reranker_dataset/data \
+  --csv-path out/reranker_dataset/dataset.csv \
+  --seed 123
+```
+
+**Run the eval to get the hits**
+```bash
+# Run the eval to create the base hits that will be use to train the reranker.
+python -m scripts.run_eval \
+  --csv out/reranker_dataset/dataset.csv \
+  --source both \
+  --final-k 100 \
+  --k-per-angle 64 \
+  --save-dir out/reranker_dataset \
+  --distance-grid 32 \
+  --distance-trim 0.05
+```
+
+**Train the re-ranker**
+```bash
+python -m scripts.train_reranker \
+  --hits-csv out/reranker_dataset/eval_hits.csv \
+  --dataset-csv out/reranker_dataset/dataset.csv \
+  --out out/reranker/reranker_listwise.pt \
+  --train-topk 100 \
+  --list-k 100 \
+  --epochs 100 \
+  --batch-size 64
+```
+
+**Search with the reranker**
+```bash
+# With re-ranker (using MLP on embeddings as reranker)
+python -m scripts.search_index \
+  out/dataset/data/00005_a_crop1.png \
+  --k 10 \
+  --k-per-angle 64 \
+  --save-dir out/search/reranked \
+  --use-reranker \
+  --reranker-model out/reranker/reranker_listwise.pt \
+  --rerank-topk 100
+```
+
+**Eval the reranker**
+```bash
 # With reranker
 python -m scripts.run_eval \
   --csv out/dataset/dataset.csv \
@@ -69,33 +113,23 @@ python -m scripts.run_eval \
   --final-k 100 \
   --k-per-angle 64 \
   --save-dir out/eval/rerank \
+  --save-k 3 \
+  --distance-grid 32 \
+  --distance-trim 0.05 \
   --use-reranker \
   --rerank-topk 100 \
-  --reranker-model-path out/reranker/reranker.pt \
+  --reranker-model-path out/reranker/reranker_listwise.pt \
   --reranker-device cuda \
-  --save-k 10
+  --reranker-batch-size 256
 ```
 
-**Run the report script**
+**Run the report for the reranker results**
 ```bash
-python -m scripts.run_report --csv out/eval/eval_hits.csv
-python -m scripts.run_report --csv out/eval/rerank/eval_hits.csv
-```
+python -m scripts.run_report \
+  --baseline out/eval/base/eval_hits.csv \
+  --rerank out/eval/rerank/eval_hits.csv
 
-**Train re-ranker**
-```bash
-python -m scripts.train_reranker \
-    --data-mode volume \
-    --allen-cache-dir volume/data/allen \
-    --allen-resolution 25 \
-    --real-nifti volume/data/real/registered_brain_25um.nii.gz \
-    --n-samples 50000 \
-    --slice-size 224 \
-    --epochs 20 \
-    --batch-size 32 \
-    --device cuda
 ```
-
 
 ## Paper 
 

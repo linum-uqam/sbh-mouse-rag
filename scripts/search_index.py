@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from index.store import IndexStore
-from index.search import SliceSearcher, SearchConfig
+from index.search import SliceSearcher, SearchConfig, SearchResult
 from index.utils import log, load_image_gray
 from index.config import OUT_DIR
 from index.vis import save_search_results_visuals
@@ -79,21 +79,6 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
-def _load_candidate_image_from_meta(meta: dict) -> np.ndarray:
-    """
-    Example: load candidate patch from PNG path in meta["png_path"].
-
-    You can replace this with any logic you want (e.g., reconstruct from volume).
-    """
-    p = Path(meta["png_path"])
-    img = Image.open(p).convert("L")
-    arr = np.array(img, dtype=np.float32)
-    if arr.max() > 1.0:
-        arr = arr / 255.0
-    return arr
-
-
 def main() -> None:
     args = parse_args()
 
@@ -148,11 +133,11 @@ def main() -> None:
         rotation_deg = m.get("rotation_deg", "?")
         extra = f" rerank={h.rerank_score:.4f}" if h.rerank_score is not None else ""
 
-        log("search", [
+        log("",[
             f"[{i:02d}] score={h.score:.4f}{extra} ",
             f"(query_angle={h.angle:.1f}°, patch_id={h.patch_id}) ",
             f"normal={normal_idx} depth={depth_idx} scale={scale} ",
-            f"box=({x0},{y0})-({x1},{y1}) depth_vox={depth_vox:.3f} rot_deg={rotation_deg:.1f}"
+            f"box=({x0},{y0})-({x1},{y1}) depth_vox={depth_vox:.3f} rot_deg={rotation_deg:.1f}\n"
         ])
 
     # 4) Optionally save visuals

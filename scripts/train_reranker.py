@@ -1,158 +1,71 @@
-# scripts/train_reranker.py
 from __future__ import annotations
-from pathlib import Path
-import argparse
 
-from index.reranker import TrainingConfig, TrainingRun
-from index.utils import log  # or replace with print
+import argparse
+from pathlib import Path
+
+from index.reranker import TrainingConfig, RerankerConfig, TrainingRun
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Train two-tower reranker (MSE regression) on image pairs."
-    )
+    p = argparse.ArgumentParser(description="Train listwise reranker from eval_hits.csv soft labels (gt_prob).")
 
-    # --- data selection ---
-    p.add_argument(
-        "--data-mode",
-        type=str,
-        default="auto",
-        choices=["auto", "csv", "volume"],
-        help="How to obtain training pairs: 'csv', 'volume', or 'auto' (default).",
-    )
+    p.add_argument("--hits-csv", type=str, default="out/reranker_dataset/eval_hits.csv")
+    p.add_argument("--dataset-csv", type=str, default="out/reranker_dataset/dataset.csv")
+    p.add_argument("--patch-vectors", type=str, default="out/index/patch_vectors.npy")
+    p.add_argument("--patch-manifest", type=str, default="out/index/patch_manifest.parquet")
+    p.add_argument("--query-cache", type=str, default="out/reranker/query_vectors.npy")
+    p.add_argument("--out", type=str, default="out/reranker/reranker_listwise.pt")
 
-    p.add_argument(
-        "--csv",
-        type=str,
-        default="",
-        help="Path to CSV with 'query_path', 'candidate_path', 'target' columns (for CSV mode).",
-    )
+    p.add_argument("--train-topk", type=int, default=100)
+    p.add_argument("--list-k", type=int, default=100)
 
-    p.add_argument(
-        "--allen-cache-dir",
-        type=str,
-        default="volume/data/allen",
-        help="Allen cache directory (for volume mode).",
-    )
-    p.add_argument(
-        "--allen-resolution",
-        type=int,
-        default=25,
-        help="Allen resolution in microns (for volume mode).",
-    )
-    p.add_argument(
-        "--real-nifti",
-        type=str,
-        default="",
-        help="Path to registered real brain NIfTI (for volume mode).",
-    )
-    p.add_argument(
-        "--n-samples",
-        type=int,
-        default=50000,
-        help="Number of pair samples to draw from volumes (for volume mode).",
-    )
-    p.add_argument(
-        "--slice-size",
-        type=int,
-        default=224,
-        help="Slice size (pixels) for volume mode.",
-    )
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--seed", type=int, default=42)
 
-    # --- training hyperparams ---
-    p.add_argument(
-        "--out",
-        type=str,
-        default="out/reranker/reranker.pt",
-        help="Output path for trained reranker weights.",
-    )
-    p.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Batch size.",
-    )
-    p.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Number of training epochs.",
-    )
-    p.add_argument(
-        "--lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for Adam optimizer.",
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use (e.g., 'cuda' or 'cpu').",
-    )
-    p.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of DataLoader workers (CSV mode only; volume mode uses 0).",
-    )
-    p.add_argument(
-        "--train-frac",
-        type=float,
-        default=0.8,
-        help="Fraction of data used for training.",
-    )
-    p.add_argument(
-        "--val-frac",
-        type=float,
-        default=0.1,
-        help="Fraction of data used for validation (rest is test).",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed.",
-    )
+    # model
+    p.add_argument("--embed-dim", type=int, default=768)
+    p.add_argument("--hidden", type=int, nargs=2, default=[512, 256])
+    p.add_argument("--dropout", type=float, default=0.15)
+    p.add_argument("--no-pair-features", action="store_true")
 
     return p.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
+    a = parse_args()
 
-    csv_path = args.csv if args.csv else None
-    real_nifti = args.real_nifti if args.real_nifti else None
-
-    cfg = TrainingConfig(
-        data_mode=args.data_mode,
-        csv_path=csv_path,
-        allen_cache_dir=args.allen_cache_dir,
-        allen_resolution_um=args.allen_resolution,
-        real_nifti_path=real_nifti,
-        n_samples=args.n_samples,
-        slice_size=args.slice_size,
-        out_path=args.out,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        lr=args.lr,
-        device=args.device,
-        num_workers=args.num_workers,
-        train_frac=args.train_frac,
-        val_frac=args.val_frac,
-        seed=args.seed,
+    tcfg = TrainingConfig(
+        hits_csv=a.hits_csv,
+        dataset_csv=a.dataset_csv,
+        patch_vectors_path=a.patch_vectors,
+        patch_manifest_path=a.patch_manifest,
+        query_vectors_cache=a.query_cache,
+        out_path=a.out,
+        train_topk=a.train_topk,
+        list_k=a.list_k,
+        batch_size=a.batch_size,
+        num_epochs=a.epochs,
+        lr=a.lr,
+        weight_decay=a.weight_decay,
+        device=a.device,
+        num_workers=a.num_workers,
+        seed=a.seed,
     )
 
-    log("Reranker training config:")
-    for k, v in cfg.to_dict().items():
-        log(f"  {k:20s} = {v}")
+    mcfg = RerankerConfig(
+        embed_dim=a.embed_dim,
+        hidden_dims=(int(a.hidden[0]), int(a.hidden[1])),
+        dropout=float(a.dropout),
+        device=a.device,
+        use_pair_features=not a.no_pair_features,
+    )
 
-    run = TrainingRun(cfg)
-    metrics = run.run()
-
-    log("Reranker training finished.")
-    for k, v in metrics.items():
-        log(f"  {k:15s} = {v:.6f}")
+    TrainingRun(tcfg, mcfg).run()
 
 
 if __name__ == "__main__":

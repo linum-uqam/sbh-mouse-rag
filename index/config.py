@@ -14,10 +14,10 @@ SLICE_SIZE = 512        # square slice size in pixels
 # scale = 2  -> 2x2 base tiles
 # scale = 4  -> 4x4 base tiles
 # scale = 8  -> 8x8 base tiles
-PATCH_SCALES = (1, 2, 4, 8)
+PATCH_SCALES = (1, 2, 4) # ,8
 
 # Overlap ratio between neighbouring windows (0.5 = 50% overlap)
-PATCH_OVERLAP = 0.5
+PATCH_OVERLAP = 0.25
 
 # --- Embedding dimension (DINOv3 ViT-B/16) ---
 D = 768

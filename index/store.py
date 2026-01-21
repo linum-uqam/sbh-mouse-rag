@@ -72,7 +72,7 @@ class IndexStore:
 
         # Optional: load vectors sidecar if present
         if vectors_path.exists():
-            self._vectors = np.load(vectors_path)
+            self._vectors = np.load(vectors_path, mmap_mode="r")
         else:
             self._vectors = None
 
@@ -133,7 +133,7 @@ class IndexStore:
         """
         if Q.ndim == 1:
             Q = Q.reshape(1, -1)
-
+        Qn = np.asarray(Q, dtype=np.float32).copy()   # copy to avoid in-place mutation
         Qn = self._normalize_queries(Q)
         D, I = self.index.search(Qn, k)
         return D, I
@@ -208,19 +208,14 @@ class IndexStore:
         """
         ids_list = [int(i) for i in ids]
 
-        # 1) If we have a sidecar matrix, use that (fast + reliable).
         if self._vectors is not None:
-            vecs = self._vectors
-            if vecs.ndim != 2:
-                raise RuntimeError(
-                    f"Loaded vectors have invalid shape: {vecs.shape}, expected (N,D)"
-                )
-            try:
-                return vecs[ids_list]
-            except IndexError as e:
-                raise IndexError(
-                    f"Some requested ids are out of range for vectors sidecar: {e}"
-                )
+            vecs = np.asarray(self._vectors, dtype=np.float32)
+            return vecs[ids_list]
+
+        raise RuntimeError(
+            "patch_vectors.npy not loaded; cannot fetch candidate embeddings for reranker. "
+            "Regenerate patch_vectors.npy or load it."
+        )
 
     # ------------------------------------------------------------------
     # Low-level I/O

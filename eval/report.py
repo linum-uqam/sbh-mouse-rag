@@ -1,404 +1,315 @@
-# eval/report.py
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import Iterable, Dict, Any, List
+from typing import Dict, Tuple, List, Optional, Iterable
 
+import numpy as np
 import pandas as pd
 
-# Include 100; will be ignored if max rank < 100.
-DEFAULT_KS = [1, 2, 5, 10, 100]
 
+# ----------------------------
+# Core per-query extraction
+# ----------------------------
 
-def _safe_available_ks(df: pd.DataFrame, ks: Iterable[int]) -> List[int]:
-    """Return only those K that are <= max rank present in df."""
-    max_rank = int(df["rank"].max()) if not df.empty else 0
-    return [k for k in ks if k <= max_rank]
-
-
-def summarize_topk_metrics(
-    df: pd.DataFrame,
-    ks: Iterable[int] = DEFAULT_KS,
-) -> Dict[int, Dict[str, Any]]:
+def _iter_queries(df: pd.DataFrame) -> Iterable[Tuple[Tuple[int, str], pd.DataFrame]]:
     """
-    Per-rank metrics: look only at hits with rank == k.
-
-    For each K and source ("allen", "real") we compute:
-
-      - n_rows                      (total distinct rows across all sources)
-      - score_mean_<src>            (mean score for rank == K)
-      - spatial_dist_vox_mean_<src> (mean spatial distance at rank == K)
-      - region_l1_error_mean_<src>  (mean region mismatch fraction [0,1])
+    Yields ((row_idx, source), dfq_sorted_by_rank)
     """
-    out: Dict[int, Dict[str, Any]] = {}
-    ks = _safe_available_ks(df, ks)
+    g = df.groupby(["row_idx", "source"], sort=False)
+    for key, dfq in g:
+        dfq = dfq.sort_values("rank", ascending=True)
+        yield (int(key[0]), str(key[1])), dfq
 
-    for k in ks:
-        dfk = df[df["rank"] == k]
-        if dfk.empty:
-            continue
 
-        stats: Dict[str, Any] = {}
-        # Total distinct rows across all sources
-        stats["n_rows"] = int(dfk["row_idx"].nunique())
-
-        # Per-source metrics
-        for src in sorted(dfk["source"].unique()):
-            dfks = dfk[dfk["source"] == src]
-            if dfks.empty:
-                continue
-
-            prefix = src  # "allen" or "real"
-            # Means; pandas .mean() ignores NaNs.
-            score_mean = float(dfks["score"].mean())
-            spatial_vox_mean = float(dfks["spatial_dist_vox"].mean())
-            region_l1_mean = float(dfks["region_l1_error"].mean())
-
-            stats[f"score_mean_{prefix}"] = score_mean
-            stats[f"spatial_dist_vox_mean_{prefix}"] = spatial_vox_mean
-            stats[f"region_l1_error_mean_{prefix}"] = region_l1_mean
-
-        out[k] = stats
-
+def _prefix_min(x: np.ndarray) -> np.ndarray:
+    out = np.empty_like(x)
+    cur = np.inf
+    for i, v in enumerate(x):
+        if np.isfinite(v) and v < cur:
+            cur = v
+        out[i] = cur
     return out
 
 
-def summarize_oracle_topk(
+def _ndcg_from_dist(d: np.ndarray, tau: float, K: int) -> float:
+    """
+    NDCG@K with relevance rel = exp(-d/tau).
+    Uses ideal ordering = ascending distance (descending rel).
+
+    Returns NaN if no finite distances.
+    """
+    if d.size == 0:
+        return float("nan")
+
+    finite = np.isfinite(d)
+    if not finite.any():
+        return float("nan")
+
+    tau = float(max(tau, 1e-6))
+    dK = d[:K]
+    finiteK = np.isfinite(dK)
+    if not finiteK.any():
+        return float("nan")
+
+    rel = np.zeros_like(dK, dtype=np.float64)
+    rel[finiteK] = np.exp(-dK[finiteK] / tau)
+
+    discounts = 1.0 / np.log2(np.arange(2, 2 + dK.size))
+    dcg = float((rel * discounts).sum())
+
+    # sort by distance ascending within available candidates
+    d_sorted = np.sort(d[np.isfinite(d)])
+    d_sorted = d_sorted[:K]
+    rel_id = np.exp(-d_sorted / tau)
+    discounts_id = 1.0 / np.log2(np.arange(2, 2 + d_sorted.size))
+    idcg = float((rel_id * discounts_id).sum())
+
+    if idcg <= 0:
+        return 0.0
+    return dcg / idcg
+
+
+def compute_metrics(
     df: pd.DataFrame,
-    ks: Iterable[int] = DEFAULT_KS,
-    spatial_ranges: Dict[str, tuple[float, float]] | None = None,
-) -> Dict[int, Dict[str, Any]]:
+    ks: List[int],
+    thresholds: List[float],
+) -> pd.DataFrame:
     """
-    Oracle@K metrics:
-
-      For each row_idx and source, keep the best (minimum) error across ranks <= K,
-      then average over rows.
-
-    This answers:
-      "If a human can pick any of the top-K from this source, how good can we get?"
-
-    For each K and source we compute:
-
-      - oracle_score_mean_<src>                  (max score among ranks <= K)
-      - oracle_spatial_dist_vox_mean_<src>       (min spatial_dist_vox among ranks <= K)
-      - oracle_region_l1_error_mean_<src>        (min region_l1_error among ranks <= K)
-      - oracle_best_rank_spatial_mean_<src>      (avg rank of best spatial hit)
-      - oracle_best_rank_region_mean_<src>       (avg rank of best region hit)
-      - oracle_best_rank_mean_<src>              (alias for spatial version)
-
-      Combined metric (spatial + region):
-
-        spatial_norm = (spatial_dist_vox - spatial_min_src) / (spatial_max_src - spatial_min_src)
-        combined_error = 0.5 * spatial_norm + 0.5 * region_l1_error
-
-      And then:
-
-      - oracle_combined_error_mean_<src>         (mean of min combined_error over ranks <= K)
-      - oracle_best_rank_combined_mean_<src>     (avg rank of best-combined hit)
+    Returns a tidy table with metrics aggregated over queries,
+    computed separately for each source and overall.
     """
-    out: Dict[int, Dict[str, Any]] = {}
-    ks = _safe_available_ks(df, ks)
+    rows = []
 
-    for k in ks:
-        dsub = df[df["rank"] <= k]
-        if dsub.empty:
-            continue
+    # Ensure needed cols
+    required = {"row_idx", "source", "rank", "geom_dist_vox"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-        stats: Dict[str, Any] = {}
+    has_tau = "gt_tau_vox" in df.columns
+    has_crop = "q_is_crop" in df.columns
 
-        for src in sorted(dsub["source"].unique()):
-            dsrc = dsub[dsub["source"] == src]
-            if dsrc.empty:
-                continue
+    def run_block(df_block: pd.DataFrame, label: str) -> None:
+        per_query = []
 
-            prefix = src  # "allen" or "real"
-            grp = dsrc.groupby("row_idx", sort=False)
+        for (row_idx, src), dfq in _iter_queries(df_block):
+            d = dfq["geom_dist_vox"].to_numpy(dtype=np.float64)
 
-            # Spatial normalization range for this source
-            if spatial_ranges and prefix in spatial_ranges:
-                spatial_min, spatial_max = spatial_ranges[prefix]
+            # K-limited prefix min for Geom@K
+            pm = _prefix_min(d)
+
+            # best geometry rank (over full list)
+            finite = np.isfinite(d)
+            if finite.any():
+                best_rank = int(np.argmin(np.where(finite, d, np.inf)) + 1)
             else:
-                spatial_min = float(dsrc["spatial_dist_vox"].min())
-                spatial_max = float(dsrc["spatial_dist_vox"].max())
-            spatial_scale = max(spatial_max - spatial_min, 1e-6)
+                best_rank = None
 
-            # Best errors (per row, for this source)
-            best_spatial_vox = grp["spatial_dist_vox"].min()
-            best_region_l1 = grp["region_l1_error"].min()
-            best_score = grp["score"].max()  # score: higher is better
+            tau_q = float(dfq["gt_tau_vox"].iloc[0]) if has_tau else float(np.nan)
 
-            # Rank of the best spatial hit (per row)
-            idx_best_spatial = grp["spatial_dist_vox"].idxmin()
-            best_ranks_spatial = dsrc.loc[idx_best_spatial, "rank"]
+            per_query.append((src, d, pm, best_rank, tau_q))
 
-            # Rank of the best region hit (per row)
-            idx_best_region = grp["region_l1_error"].idxmin()
-            best_ranks_region = dsrc.loc[idx_best_region, "rank"]
+        if not per_query:
+            return
 
-            # Combined metric per row: 0.5 * spatial_norm + 0.5 * region_l1_error
-            def _best_combined_idx(group: pd.DataFrame) -> int:
-                spatial = group["spatial_dist_vox"].astype(float)
-                spatial_norm = (spatial - spatial_min) / spatial_scale
-                combined = 0.5 * spatial_norm + 0.5 * group["region_l1_error"].astype(float)
-                return combined.idxmin()
-
-            idx_best_combined = grp.apply(_best_combined_idx)
-            best_ranks_combined = dsrc.loc[idx_best_combined, "rank"]
-
-            # Also record the combined error value at that best rank
-            # (use the same normalization as above)
-            spatial_at_best = dsrc.loc[idx_best_combined, "spatial_dist_vox"].astype(float)
-            region_at_best = dsrc.loc[idx_best_combined, "region_l1_error"].astype(float)
-            spatial_norm_at_best = (spatial_at_best - spatial_min) / spatial_scale
-            combined_at_best = 0.5 * spatial_norm_at_best + 0.5 * region_at_best
-
-            stats[f"oracle_score_mean_{prefix}"] = float(best_score.mean())
-            stats[f"oracle_spatial_dist_vox_mean_{prefix}"] = float(
-                best_spatial_vox.mean()
-            )
-            stats[f"oracle_region_l1_error_mean_{prefix}"] = float(
-                best_region_l1.mean()
-            )
-
-            # Best ranks (spatial, region, combined)
-            stats[f"oracle_best_rank_spatial_mean_{prefix}"] = float(
-                best_ranks_spatial.mean()
-            )
-            stats[f"oracle_best_rank_region_mean_{prefix}"] = float(
-                best_ranks_region.mean()
-            )
-            # Combined metric stats
-            stats[f"oracle_combined_error_mean_{prefix}"] = float(
-                combined_at_best.mean()
-            )
-            stats[f"oracle_best_rank_combined_mean_{prefix}"] = float(
-                best_ranks_combined.mean()
-            )
-
-            # Backward-compat alias (spatial-based)
-            stats[f"oracle_best_rank_mean_{prefix}"] = float(
-                best_ranks_spatial.mean()
-            )
-
-        out[k] = stats
-
-    return out
-
-
-def summarize_crop_buckets(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Error breakdown for full slices vs crops and crop-size buckets, on Top-1 hits.
-
-    Uses the metrics:
-      - spatial_dist_vox
-      - spatial_dist_um
-      - region_l1_error (and region_l1_error_pct)
-    """
-    df_top1 = df[df["rank"] == 1].copy()
-    if df_top1.empty:
-        return pd.DataFrame()
-
-    # Precompute percent for readability
-    df_top1["region_l1_error_pct"] = 100.0 * df_top1["region_l1_error"]
-
-    out_blocks: List[pd.DataFrame] = []
-
-    # Full slice vs crop
-    if "q_is_crop" in df_top1.columns:
-        by_crop = df_top1.groupby("q_is_crop").agg(
-            spatial_dist_vox=("spatial_dist_vox", "mean"),
-            spatial_dist_um=("spatial_dist_um", "mean"),
-            region_l1_error=("region_l1_error", "mean"),
-            region_l1_error_pct=("region_l1_error_pct", "mean"),
-            score=("score", "mean"),
-            count=("score", "size"),
-        )
-        by_crop.index = by_crop.index.map(lambda x: "crop" if x else "full_slice")
-        out_blocks.append(by_crop)
-
-    # Crop-size buckets (area fraction)
-    if "q_crop_area_frac" in df_top1.columns:
-        df_top1 = df_top1.copy()
-        df_top1["crop_bucket"] = pd.cut(
-            df_top1["q_crop_area_frac"].fillna(1.0),
-            bins=[0.0, 0.1, 0.25, 0.5, 0.75, 1.01],
-            labels=["<=10%", "10–25%", "25–50%", "50–75%", ">75%"],
-        )
-        by_bucket = df_top1.groupby("crop_bucket").agg(
-            spatial_dist_vox=("spatial_dist_vox", "mean"),
-            spatial_dist_um=("spatial_dist_um", "mean"),
-            region_l1_error=("region_l1_error", "mean"),
-            region_l1_error_pct=("region_l1_error_pct", "mean"),
-            score=("score", "mean"),
-            count=("score", "size"),
-        )
-        out_blocks.append(by_bucket)
-
-    if not out_blocks:
-        return pd.DataFrame()
-    return pd.concat(out_blocks, keys=["by_crop", "by_bucket"], names=["kind", "group"])
-
-
-def _print_per_rank_with_oracle(
-    per_rank: Dict[int, Dict[str, Any]],
-    oracle: Dict[int, Dict[str, Any]],
-    sources: List[str],
-) -> None:
-    """
-    Pretty-print combined per-rank and oracle stats in one block per K.
-    """
-    print("\n=== Per-rank metrics with Oracle@K ===")
-    for k in sorted(per_rank.keys()):
-        stats_rank = per_rank[k]
-        stats_oracle = oracle.get(k, {})
-
-        print(f"\nRank {k}:")
-        # n_rows across all sources at this rank
-        n_rows = stats_rank.get("n_rows", None)
-        if n_rows is not None:
-            print(f"  {'n_rows':35s} = {n_rows}")
-
-        for src in sources:
-            prefix = src
-
-            # Per-rank metrics
-            score_mean = stats_rank.get(f"score_mean_{prefix}", None)
-            spatial_mean = stats_rank.get(f"spatial_dist_vox_mean_{prefix}", None)
-            region_mean = stats_rank.get(f"region_l1_error_mean_{prefix}", None)
-
-            # Oracle metrics
-            o_score_mean = stats_oracle.get(f"oracle_score_mean_{prefix}", None)
-            o_spatial_mean = stats_oracle.get(
-                f"oracle_spatial_dist_vox_mean_{prefix}", None
-            )
-            o_region_mean = stats_oracle.get(
-                f"oracle_region_l1_error_mean_{prefix}", None
-            )
-            o_best_rank_spatial = stats_oracle.get(
-                f"oracle_best_rank_spatial_mean_{prefix}", None
-            )
-            o_best_rank_region = stats_oracle.get(
-                f"oracle_best_rank_region_mean_{prefix}", None
-            )
-            o_combined_mean = stats_oracle.get(
-                f"oracle_combined_error_mean_{prefix}", None
-            )
-            o_best_rank_combined = stats_oracle.get(
-                f"oracle_best_rank_combined_mean_{prefix}", None
-            )
-
-            # Only print this source if we have at least one metric
-            if not any(
-                v is not None
-                for v in [
-                    score_mean,
-                    spatial_mean,
-                    region_mean,
-                    o_score_mean,
-                    o_spatial_mean,
-                    o_region_mean,
-                    o_best_rank_spatial,
-                    o_best_rank_region,
-                    o_combined_mean,
-                    o_best_rank_combined,
-                ]
-            ):
+        # Aggregate overall and per-source
+        for src_name in sorted({x[0] for x in per_query} | {"ALL"}):
+            subset = [x for x in per_query if (src_name == "ALL" or x[0] == src_name)]
+            if not subset:
                 continue
 
-            print(f"  --- source = {prefix} ---")
+            n_q = len(subset)
 
-            if score_mean is not None:
-                print(
-                    f"  {f'score_mean_{prefix}':35s} = {score_mean}"
-                )
-            if spatial_mean is not None:
-                print(
-                    f"  {f'spatial_dist_vox_mean_{prefix}':35s} = {spatial_mean}"
-                )
-            if region_mean is not None:
-                print(
-                    f"  {f'region_l1_error_mean_{prefix}':35s} = {region_mean}"
-                )
+            # Geom@K
+            for K in ks:
+                geomK = []
+                for _, d, pm, _, _ in subset:
+                    kk = min(K, pm.size)
+                    v = pm[kk - 1] if kk >= 1 else np.nan
+                    geomK.append(v)
+                geomK = np.asarray(geomK, dtype=np.float64)
 
-            if o_score_mean is not None:
-                print(
-                    f"  {f'oracle_score_mean_{prefix}':35s} = {o_score_mean}"
-                )
-            if o_spatial_mean is not None:
-                print(
-                    f"  {f'oracle_spatial_dist_vox_mean_{prefix}':35s} = {o_spatial_mean}"
-                )
-            if o_region_mean is not None:
-                print(
-                    f"  {f'oracle_region_l1_error_mean_{prefix}':35s} = {o_region_mean}"
-                )
-            if o_best_rank_spatial is not None:
-                print(
-                    f"  {f'oracle_best_rank_spatial_mean_{prefix}':35s} = {o_best_rank_spatial}"
-                )
-            if o_best_rank_region is not None:
-                print(
-                    f"  {f'oracle_best_rank_region_mean_{prefix}':35s} = {o_best_rank_region}"
-                )
-            if o_combined_mean is not None:
-                print(
-                    f"  {f'oracle_combined_error_mean_{prefix}':35s} = {o_combined_mean}"
-                )
-            if o_best_rank_combined is not None:
-                print(
-                    f"  {f'oracle_best_rank_combined_mean_{prefix}':35s} = {o_best_rank_combined}"
-                )
+                rows.append({
+                    "group": label,
+                    "source": src_name,
+                    "metric": f"Geom@{K}_mean",
+                    "value": float(np.nanmean(geomK)),
+                    "n_queries": n_q,
+                })
+                rows.append({
+                    "group": label,
+                    "source": src_name,
+                    "metric": f"Geom@{K}_median",
+                    "value": float(np.nanmedian(geomK)),
+                    "n_queries": n_q,
+                })
+
+            # RankBestGeom
+            ranks = np.asarray([r if r is not None else np.nan for *_, r, __ in subset], dtype=np.float64)
+            rows.append({
+                "group": label,
+                "source": src_name,
+                "metric": "RankBestGeom_mean",
+                "value": float(np.nanmean(ranks)),
+                "n_queries": n_q,
+            })
+            rows.append({
+                "group": label,
+                "source": src_name,
+                "metric": "RankBestGeom_median",
+                "value": float(np.nanmedian(ranks)),
+                "n_queries": n_q,
+            })
+
+            # SR@K(thr) and MRR_geom(thr)
+            for thr in thresholds:
+                thr = float(thr)
+
+                # SR@K at K=10 and K=100 are the usual; keep both
+                for K in [10, 100]:
+                    sr = []
+                    for _, d, _, _, _ in subset:
+                        kk = min(K, d.size)
+                        if kk <= 0:
+                            sr.append(0.0)
+                            continue
+                        dd = d[:kk]
+                        ok = np.isfinite(dd) & (dd <= thr)
+                        sr.append(1.0 if ok.any() else 0.0)
+                    rows.append({
+                        "group": label,
+                        "source": src_name,
+                        "metric": f"SR@{K}(thr={thr:.2f})",
+                        "value": float(np.mean(sr)) if sr else float("nan"),
+                        "n_queries": n_q,
+                    })
+
+                # MRR over full list (cap at 100)
+                mrr = []
+                for _, d, _, _, _ in subset:
+                    kk = min(100, d.size)
+                    if kk <= 0:
+                        mrr.append(0.0)
+                        continue
+                    dd = d[:kk]
+                    ok = np.isfinite(dd) & (dd <= thr)
+                    if not ok.any():
+                        mrr.append(0.0)
+                    else:
+                        r = int(np.argmax(ok) + 1)  # first True
+                        mrr.append(1.0 / float(r))
+                rows.append({
+                    "group": label,
+                    "source": src_name,
+                    "metric": f"MRR_geom(thr={thr:.2f})",
+                    "value": float(np.mean(mrr)) if mrr else float("nan"),
+                    "n_queries": n_q,
+                })
+
+            # NDCG@K (use tau_query if present, else use global scale=median Geom@1)
+            for K in [10, 100]:
+                ndcgs = []
+                for _, d, _, __, tau_q in subset:
+                    if not np.isfinite(tau_q):
+                        # fallback scale: median finite distance in this query list
+                        finite = d[np.isfinite(d)]
+                        tau_use = float(np.median(finite)) if finite.size else float("nan")
+                    else:
+                        tau_use = tau_q
+
+                    ndcgs.append(_ndcg_from_dist(d, tau=tau_use, K=min(K, d.size)))
+
+                ndcgs = np.asarray(ndcgs, dtype=np.float64)
+                rows.append({
+                    "group": label,
+                    "source": src_name,
+                    "metric": f"NDCG@{K}_mean",
+                    "value": float(np.nanmean(ndcgs)),
+                    "n_queries": n_q,
+                })
+                rows.append({
+                    "group": label,
+                    "source": src_name,
+                    "metric": f"NDCG@{K}_median",
+                    "value": float(np.nanmedian(ndcgs)),
+                    "n_queries": n_q,
+                })
+
+    # main blocks: overall + (optional) crop vs full
+    run_block(df, "ALL")
+
+    if has_crop:
+        run_block(df[df["q_is_crop"] == False], "FULL")
+        run_block(df[df["q_is_crop"] == True], "CROP")
+
+    return pd.DataFrame(rows)
 
 
-def run_report(
-    csv_path: str | Path,
-    ks: Iterable[int] = DEFAULT_KS,
-    save_summary: bool = True,
-) -> None:
-    csv_path = Path(csv_path)
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        print(f"No rows in {csv_path}")
-        return
+def choose_thresholds_from_baseline(df_base: pd.DataFrame) -> List[float]:
+    """
+    Thresholds in vox derived from baseline Geom@1 distribution (P25/P50/P75).
+    """
+    # Extract top-1 per query (rank==1) distances
+    df1 = df_base[df_base["rank"] == 1]
+    d1 = df1["geom_dist_vox"].to_numpy(dtype=np.float64)
+    d1 = d1[np.isfinite(d1)]
+    if d1.size == 0:
+        return [50.0, 100.0, 200.0]
+    p25, p50, p75 = np.quantile(d1, [0.25, 0.50, 0.75]).tolist()
+    # Ensure strictly positive, readable
+    return [float(max(1e-6, p25)), float(max(1e-6, p50)), float(max(1e-6, p75))]
 
-    # Backward-compat: if old column name exists, alias it.
-    if "region_l1_error" not in df.columns and "region_mse" in df.columns:
-        df["region_l1_error"] = df["region_mse"]
 
-    print(f"Loaded eval hits from: {csv_path} (rows={len(df)})")
+def _pivot(metrics: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    Pivot to: rows=(group,source,metric) cols=value
+    """
+    return metrics.pivot_table(
+        index=["group", "source", "metric"],
+        values=value_col,
+        aggfunc="first",
+    ).sort_index()
 
-    sources = sorted(df["source"].unique())
 
-    # Precompute spatial min/max per source for normalization of combined metric
-    spatial_ranges = {}
-    for src in sources:
-        dsrc = df[df["source"] == src]
-        if dsrc.empty:
-            continue
-        mn = float(dsrc["spatial_dist_vox"].min())
-        mx = float(dsrc["spatial_dist_vox"].max())
-        spatial_ranges[src] = (mn, mx)
+def compare_reports(df_base: pd.DataFrame, df_rerank: pd.DataFrame, ks: List[int]) -> None:
+    thr = choose_thresholds_from_baseline(df_base)
+    print(f"\nThresholds (vox) from baseline Geom@1 percentiles: {', '.join(f'{t:.2f}' for t in thr)}")
 
-    # ---- per-rank & oracle ----
-    per_rank = summarize_topk_metrics(df, ks)
-    oracle = summarize_oracle_topk(df, ks, spatial_ranges=spatial_ranges)
-    _print_per_rank_with_oracle(per_rank, oracle, sources)
+    m_base = compute_metrics(df_base, ks=ks, thresholds=thr)
+    m_rer  = compute_metrics(df_rerank, ks=ks, thresholds=thr)
 
-    # ---- crop buckets ----
-    crop_summary = summarize_crop_buckets(df)
-    if not crop_summary.empty:
-        print("\n=== Crop / size breakdown (Top-1 only) ===")
-        print(crop_summary)
+    p_base = _pivot(m_base, "value").rename(columns={"value": "baseline"})
+    p_rer  = _pivot(m_rer, "value").rename(columns={"value": "rerank"})
 
-    # ---- save summary CSV ----
-    if save_summary:
-        out_path = csv_path.with_name("eval_summary.csv")
-        rows = []
-        for k, stats in per_rank.items():
-            rows.append({"mode": "per_rank", "K": k, **stats})
-        for k, stats in oracle.items():
-            rows.append({"mode": "oracle", "K": k, **stats})
-        if rows:
-            df_sum = pd.DataFrame(rows)
-            df_sum.to_csv(out_path, index=False)
-            print(f"\nSaved summary stats to: {out_path}")
+    joined = p_base.join(p_rer, how="outer")
+    joined["delta"] = joined["rerank"] - joined["baseline"]
+
+    with pd.option_context(
+        "display.max_rows", 500,
+        "display.max_columns", 10,
+        "display.width", 220,
+        "display.float_format", lambda x: f"{x:10.4f}",
+    ):
+        print("\n=== Baseline vs Rerank (rerank - baseline) ===")
+        print(joined)
+
+
+def single_report(df: pd.DataFrame, ks: List[int]) -> None:
+    # thresholds based on that file itself
+    thr = choose_thresholds_from_baseline(df)
+    print(f"\nThresholds (vox) from Geom@1 percentiles: {', '.join(f'{t:.2f}' for t in thr)}")
+
+    m = compute_metrics(df, ks=ks, thresholds=thr)
+    p = _pivot(m, "value")
+
+    with pd.option_context(
+        "display.max_rows", 500,
+        "display.max_columns", 10,
+        "display.width", 220,
+        "display.float_format", lambda x: f"{x:10.4f}",
+    ):
+        print("\n=== Metrics ===")
+        print(p)
+
+

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -12,8 +12,12 @@ from PIL import Image
 from index.store import IndexStore
 from index.model.dino import model
 from index.utils import log
-from index.config import SLICE_SIZE
 from index.reranker.runtime import RerankerRuntimeConfig, RerankerService
+
+
+RerankQueryMode = Literal["best_angle", "max_over_angles", "per_hit_angle"]
+BlendNormMode = Literal["zscore", "minmax"]
+
 
 @dataclass
 class SearchConfig:
@@ -21,18 +25,31 @@ class SearchConfig:
     Configuration for image → patch search.
     """
     angles: Tuple[float, ...] = (0.0, 90.0, 180.0, 270.0)
-    k_per_angle: int = 64          # how many neighbours per rotation
-    crop_foreground: bool = True   # auto-crop query around tissue
-    bg_threshold: float = 0.05     # pixel threshold for "foreground"
-    min_fg_ratio: float = 0.05     # if less than this, skip cropping
-    verbose: bool = True           # control logging (e.g. auto-crop log)
+    k_per_angle: int = 64
+    crop_foreground: bool = True
+    bg_threshold: float = 0.05
+    min_fg_ratio: float = 0.05
+    verbose: bool = True
 
     # --- optional neural reranker (embedding-only) ---
     use_reranker: bool = False
-    rerank_topk: int = 10
-    reranker_model_path: Path = Path("out/reranker/reranker.pt")
+    rerank_topk: int = 100
+    rerank_query_mode: RerankQueryMode = "max_over_angles"
+
+    reranker_model_path: Path = Path("out/reranker/reranker_listwise.pt")
     reranker_device: str = "cuda"
-    reranker_batch_size: int = 32
+    reranker_batch_size: int = 256
+
+    # should generally match what you trained with
+    reranker_normalize_embeddings: bool = True
+    reranker_use_fp16: bool = True
+    reranker_compile: bool = False
+
+    # --- blend reranker + cosine ---
+    # final_score = (1 - rerank_alpha) * cosine + rerank_alpha * reranker
+    rerank_alpha: float = 1.0  # 1.0 = pure reranker (previous behavior), 0.5 = half/half
+    blend_normalize: bool = True
+    blend_norm_mode: BlendNormMode = "zscore"  # "zscore" or "minmax"
 
 
 @dataclass
@@ -42,9 +59,9 @@ class SearchResult:
     """
     patch_id: int
     score: float
-    angle: float  # query rotation angle that produced this score
-    meta: Dict[str, Any]  # manifest row as dict
-    rerank_score: float | None = None  # optional reranker score
+    angle: float  # query rotation angle that produced this coarse score
+    meta: Dict[str, Any]
+    rerank_score: float | None = None
 
 
 class SliceSearcher:
@@ -61,13 +78,15 @@ class SliceSearcher:
         self.store = store
         self.cfg = cfg or SearchConfig()
 
-        # Lazy-initialized reranker
-        self.reranker: RerankerService | None = None
+        self.reranker: Optional[RerankerService] = None
         if self.cfg.use_reranker:
             rr_cfg = RerankerRuntimeConfig(
                 model_path=self.cfg.reranker_model_path,
                 device=self.cfg.reranker_device,
                 batch_size=self.cfg.reranker_batch_size,
+                normalize_embeddings=self.cfg.reranker_normalize_embeddings,
+                use_fp16=self.cfg.reranker_use_fp16,
+                compile_model=self.cfg.reranker_compile,
             )
             self.reranker = RerankerService(rr_cfg)
 
@@ -75,35 +94,28 @@ class SliceSearcher:
     # Public API
     # ------------------------------------------------------------------
 
-    def search_image(
-        self,
-        img_np: np.ndarray,
-        k: int = 10,
-    ) -> Tuple[List[SearchResult], np.ndarray]:
+    def search_image(self, img_np: np.ndarray, k: int = 10) -> Tuple[List[SearchResult], np.ndarray]:
         """
-        Search using a query image and ALSO return the preprocessed query
-        actually used for embedding (after grayscale + optional crop).
-
-        Returns:
-            hits: List[SearchResult]
-            q   : np.ndarray (H,W) in [0,1]
+        Search using a query image and return:
+          - hits (with meta)
+          - q: the preprocessed query image used for embedding (H,W) float32 in [0,1]
         """
         # 1) normalize to grayscale [0,1] and optionally crop
         q, q_pil = self._prepare_query(img_np)
 
         # 2) build rotated views as PIL grayscale
-        angles = self.cfg.angles
-        pils = [q_pil.rotate(float(a), resample=Image.BILINEAR, expand=False) for a in angles]
+        angles = tuple(float(a) for a in self.cfg.angles)
+        pils = [q_pil.rotate(a, resample=Image.BILINEAR, expand=False) for a in angles]
 
         # 3) embed all rotations in a single batch -> (A,D)
-        #    (A = number of angles)
         G = model.embed_pil_batch(pils).astype(np.float32, copy=False)  # (A, D)
+        if G.ndim != 2:
+            raise ValueError(f"Expected embeddings (A,D), got {G.shape}")
 
         # 4) single FAISS call for all rotations at once
-        #    D_all, I_all: (A, k_per_angle)
-        D_all, I_all = self.store.search(G, self.cfg.k_per_angle)
+        D_all, I_all = self.store.search(G, self.cfg.k_per_angle)  # each (A, k_per_angle)
 
-        # 5) accumulate best score per patch id over all rotations
+        # 5) accumulate best coarse score per patch id over all rotations
         best: Dict[int, Tuple[float, float]] = {}  # patch_id -> (score, angle)
 
         for a_idx, angle in enumerate(angles):
@@ -113,86 +125,40 @@ class SliceSearcher:
             for score, pid in zip(d_row, i_row):
                 pid = int(pid)
                 if pid < 0:
-                    continue  # FAISS uses -1 for "no hit"
-                if pid not in best or score > best[pid][0]:
-                    best[pid] = (float(score), float(angle))
+                    continue
+                sc = float(score)
+                if pid not in best or sc > best[pid][0]:
+                    best[pid] = (sc, float(angle))
 
         if not best:
             return [], q
 
-        # 6) sort by score descending and keep top-k
+        # 6) sort by score desc and keep top-k
         sorted_hits = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
-        top = sorted_hits[:k]
+        top = sorted_hits[: int(k)]
 
         ids = [pid for pid, _ in top]
         df_rows = self.store.rows_for_ids(ids)
 
         results: List[SearchResult] = []
         for pid, (score, angle) in top:
-            row = df_rows.loc[pid]
-            meta = row.to_dict()
+            row = df_rows.loc[int(pid)]
             results.append(
                 SearchResult(
                     patch_id=int(pid),
-                    score=float(score),
+                    score=float(score),  # coarse cosine similarity (FAISS)
                     angle=float(angle),
-                    meta=meta,
+                    meta=row.to_dict(),
                 )
             )
 
-        # 7) Optional neural reranking (embedding-only, per-angle)
+        # 7) Optional reranking (embedding-only)
         if self.cfg.use_reranker and self.reranker is not None and results:
-            # Map angle value -> index in G
-            # (Use nearest match to be robust to small float differences.)
-            angle_list = [float(a) for a in angles]
-
-            def _angle_to_idx(a_val: float) -> int:
-                return int(
-                    min(range(len(angle_list)), key=lambda i: abs(angle_list[i] - float(a_val)))
-                )
-
-            # Candidate embeddings from sidecar matrix, aligned with `results`
-            ids_for_rerank = [h.patch_id for h in results]
-            cand_embs = self.store.vectors_for_ids(ids_for_rerank)  # (N,D)
-
-            N = len(results)
-            topk = max(1, min(self.cfg.rerank_topk, N))
-
-            top_hits = results[:topk]
-            top_cand_embs = cand_embs[:topk]  # (topk, D)
-            rest_hits = results[topk:]
-
-            # Build per-hit query embeddings based on each hit's best angle
-            D = top_cand_embs.shape[1]
-            q_embs = np.zeros((topk, D), dtype=np.float32)
-            for i, h in enumerate(top_hits):
-                a_idx = _angle_to_idx(h.angle)
-                q_embs[i] = G[a_idx]
-
-            # Get reranker scores (per-candidate query embedding)
-            scores = self.reranker.score_emb_pairs(q_embs, top_cand_embs)
-
-            for h, s in zip(top_hits, scores):
-                h.rerank_score = float(s)
-
-            # Sort by rerank_score desc; tie-breaker: original coarse score
-            top_hits_sorted = sorted(
-                top_hits,
-                key=lambda h: (
-                    h.rerank_score if h.rerank_score is not None else -1e9,
-                    h.score,
-                ),
-                reverse=True,
-            )
-
-            results = top_hits_sorted + rest_hits
+            self._apply_reranker(results, G, angles)
 
         return results, q
 
     def to_dataframe(self, hits: List[SearchResult]) -> pd.DataFrame:
-        """
-        Convert a list of SearchResult into a pandas DataFrame.
-        """
         rows: List[Dict[str, Any]] = []
         for h in hits:
             row = dict(h.meta)
@@ -205,26 +171,135 @@ class SliceSearcher:
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
+    # Reranker integration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_scores(x: np.ndarray, mode: str = "zscore") -> np.ndarray:
+        """
+        Normalize a 1D score vector for blending.
+        - zscore: (x - mean) / std
+        - minmax: (x - min) / (max - min)
+        If the vector is (near) constant, returns zeros.
+        """
+        x = np.asarray(x, dtype=np.float32)
+        if x.size == 0:
+            return x
+
+        if mode == "zscore":
+            mu = float(x.mean())
+            sd = float(x.std())
+            if sd < 1e-6:
+                return np.zeros_like(x)
+            return (x - mu) / sd
+
+        if mode == "minmax":
+            lo = float(x.min())
+            hi = float(x.max())
+            if (hi - lo) < 1e-6:
+                return np.zeros_like(x)
+            return (x - lo) / (hi - lo)
+
+        raise ValueError(f"Unknown normalize mode: {mode!r}")
+
+    def _apply_reranker(self, results: List[SearchResult], G: np.ndarray, angles: Tuple[float, ...]) -> None:
+        """
+        Rerank only the top `rerank_topk` results, then keep the remainder in coarse order.
+
+        Modes:
+          - best_angle: use query embedding of the best coarse hit's angle (single listwise call)
+          - max_over_angles: score listwise per angle, take max score per candidate
+          - per_hit_angle: score each hit using its own best angle (uses score_pairs; less "listwise-pure")
+
+        Blending:
+          final_score = (1 - alpha) * cosine + alpha * reranker
+          with optional per-query normalization before blending.
+        """
+        assert self.reranker is not None
+
+        N = len(results)
+        topk = int(max(1, min(self.cfg.rerank_topk, N)))
+
+        top_hits = results[:topk]
+        rest_hits = results[topk:]
+
+        ids_for_rerank = [h.patch_id for h in top_hits]
+        cand_embs = self.store.vectors_for_ids(ids_for_rerank).astype(np.float32, copy=False)  # (topk,D)
+
+        mode = self.cfg.rerank_query_mode
+
+        # --- compute reranker scores (topk,) ---
+        if mode == "best_angle":
+            q_angle = float(top_hits[0].angle)
+            a_idx = self._angle_to_idx(q_angle, angles)
+            q_emb = G[a_idx]
+            scores = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
+
+        elif mode == "max_over_angles":
+            all_scores = []
+            for a_idx in range(len(angles)):
+                q_emb = G[a_idx]
+                s = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
+                all_scores.append(s)
+            scores = np.max(np.stack(all_scores, axis=0), axis=0).astype(np.float32, copy=False)
+
+        elif mode == "per_hit_angle":
+            q_embs = np.stack([G[self._angle_to_idx(float(h.angle), angles)] for h in top_hits], axis=0)  # (topk,D)
+            scores = self.reranker.score_pairs(q_embs, cand_embs)  # (topk,)
+
+        else:
+            raise ValueError(f"Unknown rerank_query_mode={mode!r}")
+
+        scores = np.asarray(scores, dtype=np.float32)
+
+        # --- NEW: blend reranker + cosine (over the reranked topk) ---
+        alpha = float(self.cfg.rerank_alpha)
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+
+        coarse = np.asarray([h.score for h in top_hits], dtype=np.float32)
+
+        if bool(self.cfg.blend_normalize):
+            mode_n = str(self.cfg.blend_norm_mode)
+            coarse_n = self._normalize_scores(coarse, mode=mode_n)
+            rerank_n = self._normalize_scores(scores, mode=mode_n)
+        else:
+            coarse_n = coarse
+            rerank_n = scores
+
+        blended = (1.0 - alpha) * coarse_n + alpha * rerank_n
+
+        # store raw rerank score for logging/CSV, but use blended for ranking by overwriting h.score
+        for h, s_raw, s_blend in zip(top_hits, scores, blended):
+            h.rerank_score = float(s_raw)
+            h.score = float(s_blend)
+
+        # Sort top_hits by blended score desc; tie-breaker: raw reranker
+        top_hits_sorted = sorted(
+            top_hits,
+            key=lambda h: (h.score, h.rerank_score if h.rerank_score is not None else -1e9),
+            reverse=True,
+        )
+
+        results[:] = top_hits_sorted + rest_hits
+
+    @staticmethod
+    def _angle_to_idx(a_val: float, angles: Tuple[float, ...]) -> int:
+        # robust nearest match (float-safe)
+        return int(min(range(len(angles)), key=lambda i: abs(float(angles[i]) - float(a_val))))
+
+    # ------------------------------------------------------------------
     # Query preprocessing
     # ------------------------------------------------------------------
 
     def _prepare_query(self, img_np: np.ndarray) -> Tuple[np.ndarray, Image.Image]:
-        """
-        Full query preprocessing pipeline:
-
-          - convert to grayscale
-          - normalize to float32 [0,1]
-          - optional foreground crop
-          - return both numpy (H,W) and PIL (grayscale) views
-        """
         x = np.asarray(img_np)
 
         # Handle channels if present
         if x.ndim == 3 and x.shape[2] in (1, 3):
             if x.shape[2] == 3:
-                x = x.mean(axis=2)      # RGB -> gray
+                x = x.mean(axis=2)
             else:
-                x = x[..., 0]          # (H,W,1) -> (H,W)
+                x = x[..., 0]
 
         if x.ndim != 2:
             raise ValueError(f"Expected (H,W) or (H,W,1/3) array, got shape {x.shape}")
@@ -234,26 +309,18 @@ class SliceSearcher:
             x = x / 255.0
         x = np.clip(x, 0.0, 1.0)
 
-        # optional auto-crop on the normalized grayscale
         if self.cfg.crop_foreground:
             x = self._auto_crop_foreground(x)
 
-        # build PIL grayscale from the *final* query array
-        x8 = (np.clip(x, 0.0, 1.0) * 255.0).astype(np.uint8)
+        x8 = (x * 255.0).astype(np.uint8, copy=False)
         pil = Image.fromarray(x8, mode="L")
-
         return x, pil
 
     def _auto_crop_foreground(self, img: np.ndarray) -> np.ndarray:
-        """
-        Auto-crop around foreground region using a simple intensity threshold.
-        If not enough foreground is found, returns the image unchanged.
-        """
         cfg = self.cfg
         mask = img > float(cfg.bg_threshold)
         fg_ratio = float(mask.sum()) / float(mask.size)
 
-        # Not enough foreground → don't crop at all.
         if fg_ratio < cfg.min_fg_ratio:
             return img
 

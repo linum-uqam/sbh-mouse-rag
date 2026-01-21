@@ -1,347 +1,187 @@
-# index/reranker/trainer.py
 from __future__ import annotations
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
 
+from pathlib import Path
+from typing import Dict, List
+
+import csv
 import random
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-import csv
 
-from .model import TwoTowerReranker, RerankerConfig
-from .dataset import ImagePairDataset, VolumePairDataset
-from index.utils import log
-from volume.volume_helper import AllenVolume, NiftiVolume
+from .config import TrainingConfig, RerankerConfig
+from .data import prepare_dataloaders
+from .model import ListwiseReranker
 
 
-@dataclass
-class TrainingConfig:
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[Reranker] Seed set to {seed}")
+
+
+def masked_log_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
-    Configuration for a reranker training run.
+    logits: (..., K)
+    mask:   (..., K) bool
+    returns log_softmax over valid positions; invalid positions are -inf.
     """
+    mask = mask.to(dtype=torch.bool)
+    very_neg = torch.finfo(logits.dtype).min / 2
+    x = logits.masked_fill(~mask, very_neg)
 
-    # --- data selection ---
-    data_mode: str = "auto"        # "auto" | "csv" | "volume"
-    csv_path: Optional[str] = None
-
-    # Volume-based mode options
-    allen_cache_dir: str = "volume/data/allen"
-    allen_resolution_um: int = 25
-    real_nifti_path: Optional[str] = None
-    n_samples: int = 50000
-    slice_size: int = 224
-
-    # --- training ---
-    out_path: str = "out/reranker/reranker.pt"
-    batch_size: int = 32
-    num_epochs: int = 10
-    lr: float = 1e-3
-    device: str = "cuda"
-    num_workers: int = 4  # only used for CSV mode; volume mode uses 0
-    train_frac: float = 0.8
-    val_frac: float = 0.1
-    seed: int = 42
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+    # stable log-softmax (only valid entries contribute)
+    x_max = x.max(dim=dim, keepdim=True).values
+    x = x - x_max
+    exp_x = torch.exp(x).masked_fill(~mask, 0.0)
+    denom = exp_x.sum(dim=dim, keepdim=True).clamp_min(1e-12)
+    return x - torch.log(denom)
 
 
 class TrainingRun:
-    """
-    Encapsulates a full reranker training run:
-      - dataset loading + splitting
-      - model setup
-      - training loop (MSE regression)
-      - final evaluation + saving
-    """
-
-    def __init__(self, cfg: TrainingConfig):
+    def __init__(self, cfg: TrainingConfig, model_cfg: RerankerConfig | None = None):
         self.cfg = cfg
-        self.device = torch.device(cfg.device)
+        self.model_cfg = model_cfg or RerankerConfig(device=cfg.device)
 
-        self.full_dataset = None
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
+        self.device = torch.device(cfg.device)
+        self.model: ListwiseReranker | None = None
+        self.optimizer: torch.optim.Optimizer | None = None
 
         self.train_loader: DataLoader | None = None
         self.val_loader: DataLoader | None = None
         self.test_loader: DataLoader | None = None
 
-        self.model: TwoTowerReranker | None = None
-        self.criterion: nn.Module | None = None
-        self.optimizer: torch.optim.Optimizer | None = None
-
-    # ---------- top-level entry point ----------
+        self.use_amp = (self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     def run(self) -> Dict[str, float]:
-        """
-        Run the full training loop and return final metrics.
-        """
-        self._set_seed(self.cfg.seed)
-        self._setup_datasets()
+        set_global_seed(self.cfg.seed)
+
+        # Data
+        self.train_loader, self.val_loader, self.test_loader = prepare_dataloaders(
+            self.cfg, embed_dim=int(self.model_cfg.embed_dim)
+        )
+
+        # Model
         self._setup_model()
 
         best_val_loss = float("inf")
-        history: list[dict[str, float]] = []
+        history: List[Dict[str, float]] = []
 
         for epoch in range(1, self.cfg.num_epochs + 1):
-            train_loss = self._run_epoch(
-                self.train_loader, train=True, epoch=epoch, phase="train"
-            )
-            val_loss = self._run_epoch(
-                self.val_loader, train=False, epoch=epoch, phase="val"
-            )
+            train_loss = self._run_epoch(self.train_loader, train=True, epoch=epoch, phase="train")
+            val_loss = self._run_epoch(self.val_loader, train=False, epoch=epoch, phase="val")
 
-            history.append(
-                {
-                    "epoch": float(epoch),
-                    "train_loss": float(train_loss),
-                    "val_loss": float(val_loss),
-                }
-            )
+            history.append({"epoch": float(epoch), "train_loss": float(train_loss), "val_loss": float(val_loss)})
 
-            log(
-                f"Reranker | epoch={epoch:03d} "
-                f"| train_loss={train_loss:.6f} "
-                f"| val_loss={val_loss:.6f}"
-            )
+            print(f"[Reranker] epoch={epoch:03d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                assert self.model is not None
                 self.model.save(self.cfg.out_path)
 
-        # Reload best model for test evaluation
-        self.model = TwoTowerReranker.load(
-            self.cfg.out_path,
-            encoder=None,  # default encoder (dino_model)
-            map_location=self.device,
-        )
-        test_loss = self._run_epoch(
-            self.test_loader, train=False, epoch=self.cfg.num_epochs + 1, phase="test"
-        )
-        log(f"Reranker | final_test_loss={test_loss:.6f}")
+        # Test (load best)
+        self.model = ListwiseReranker.load(self.cfg.out_path, map_location=self.device)
+        test_loss = self._run_epoch(self.test_loader, train=False, epoch=self.cfg.num_epochs + 1, phase="test")
+        print(f"[Reranker] final_test_loss={test_loss:.6f}")
 
-        # Save history as CSV next to model
         self._save_history_csv(history, best_val_loss, test_loss)
-
-        return {
-            "best_val_loss": best_val_loss,
-            "test_loss": test_loss,
-        }
-
-
-
-    # ---------- setup helpers ----------
-
-    def _set_seed(self, seed: int) -> None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        log(f"[Reranker] Seed set to {seed}")
-
-    def _setup_datasets(self) -> None:
-        mode = self.cfg.data_mode.lower()
-        if mode == "csv":
-            self._setup_datasets_from_csv()
-        elif mode == "volume":
-            self._setup_datasets_from_volume()
-        elif mode == "auto":
-            if self.cfg.csv_path is not None and Path(self.cfg.csv_path).exists():
-                log("[Reranker] data_mode=auto -> using CSV because file exists.")
-                self._setup_datasets_from_csv()
-            else:
-                log("[Reranker] data_mode=auto -> CSV missing, falling back to volume mode.")
-                self._setup_datasets_from_volume()
-        else:
-            raise ValueError(f"Unknown data_mode={self.cfg.data_mode!r}; expected 'auto', 'csv' or 'volume'.")
-
-    def _setup_datasets_from_csv(self) -> None:
-        assert self.cfg.csv_path is not None, "csv_path must be set in CSV mode."
-        csv_path = Path(self.cfg.csv_path)
-        log(f"[Reranker] Loading dataset from CSV: {csv_path}")
-        full_ds = ImagePairDataset(csv_path)
-
-        n = len(full_ds)
-        n_train = int(round(self.cfg.train_frac * n))
-        n_val = int(round(self.cfg.val_frac * n))
-        n_test = n - n_train - n_val
-        log(f"[Reranker] Dataset sizes (CSV): total={n}, train={n_train}, val={n_val}, test={n_test}")
-
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            full_ds, [n_train, n_val, n_test]
-        )
-
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=self.cfg.num_workers,
-        )
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-        )
-        self.test_loader = DataLoader(
-            self.test_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=self.cfg.num_workers,
-        )
-
-    def _setup_datasets_from_volume(self) -> None:
-        # Ensure we have a real volume path
-        if self.cfg.real_nifti_path is None:
-            raise ValueError(
-                "real_nifti_path must be provided for volume mode "
-                "(e.g. 'volume/data/real/registered_brain_25um.nii.gz')."
-            )
-
-        log("[Reranker] Initializing AllenVolume and NiftiVolume for volume-based dataset...")
-        allen = AllenVolume(
-            cache_dir=self.cfg.allen_cache_dir,
-            resolution_um=self.cfg.allen_resolution_um,
-        )
-        real = NiftiVolume(self.cfg.real_nifti_path)
-
-        full_ds = VolumePairDataset(
-            allen=allen,
-            real=real,
-            n_samples=self.cfg.n_samples,
-            slice_size=self.cfg.slice_size,
-            # multi-scale + augmentation enabled by default
-            enable_crops=True,
-            crop_prob=0.8,
-            enable_augment=True,
-        )
-
-        n = len(full_ds)
-        n_train = int(round(self.cfg.train_frac * n))
-        n_val = int(round(self.cfg.val_frac * n))
-        n_test = n - n_train - n_val
-        log(f"[Reranker] Dataset sizes (volume): total={n}, train={n_train}, val={n_val}, test={n_test}")
-
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            full_ds, [n_train, n_val, n_test]
-        )
-
-        # num_workers=0 to avoid copying big volumes around
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=True,
-            num_workers=0,
-        )
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
-        self.test_loader = DataLoader(
-            self.test_dataset,
-            batch_size=self.cfg.batch_size,
-            shuffle=False,
-            num_workers=0,
-        )
+        return {"best_val_loss": best_val_loss, "test_loss": test_loss}
 
     def _setup_model(self) -> None:
-        reranker_cfg = RerankerConfig(device=self.cfg.device)
-        self.model = TwoTowerReranker(cfg=reranker_cfg)
+        self.model = ListwiseReranker(cfg=self.model_cfg)
         self.model.to(self.device)
 
-        self.criterion = nn.MSELoss()
-        # Only train the head (encoder is frozen)
-        self.optimizer = torch.optim.Adam(self.model.head.parameters(), lr=self.cfg.lr)
-
-        log(
-            "[Reranker] Model initialized: "
-            f"embed_dim={reranker_cfg.embed_dim}, hidden={tuple(reranker_cfg.hidden_dims)}, "
-            f"device={self.cfg.device}, lr={self.cfg.lr}"
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(self.cfg.lr),
+            weight_decay=float(self.cfg.weight_decay),
         )
 
-    def _save_history_csv(
-        self,
-        history: list[dict[str, float]],
-        best_val: float,
-        test_loss: float,
-    ) -> None:
-        """
-        Save per-epoch train/val loss progression to a simple CSV file.
-        """
-        out_path = Path(self.cfg.out_path)
-        hist_path = out_path.with_suffix(".history.csv")
-        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            "[Reranker] Model initialized:\n"
+            f"  - embed_dim      : {self.model_cfg.embed_dim}\n"
+            f"  - hidden_dims    : {self.model_cfg.hidden_dims}\n"
+            f"  - dropout        : {self.model_cfg.dropout}\n"
+            f"  - pair_features  : {self.model_cfg.use_pair_features}\n"
+            f"  - list_k         : {self.cfg.list_k}\n"
+            f"  - train_topk     : {self.cfg.train_topk}\n"
+            f"  - lr             : {self.cfg.lr}\n"
+            f"  - weight_decay   : {self.cfg.weight_decay}\n"
+            f"  - grad_clip_norm : {self.cfg.grad_clip_norm}\n"
+            f"  - amp            : {self.use_amp}"
+        )
 
-        fieldnames = ["epoch", "train_loss", "val_loss"]
-        with hist_path.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in history:
-                writer.writerow(row)
-
-        log(f"Reranker | saved loss history to {hist_path}")
-
-
-    # ---------- epoch loop ----------
-
-    def _run_epoch(
-        self,
-        loader: DataLoader,
-        train: bool,
-        epoch: int,
-        phase: str,
-    ) -> float:
+    def _run_epoch(self, loader: DataLoader, train: bool, epoch: int, phase: str) -> float:
         assert self.model is not None
-        assert self.criterion is not None
         assert self.optimizer is not None
+        assert loader is not None
 
-        if train:
-            self.model.train()
-        else:
-            self.model.eval()
+        self.model.train(train)
 
         total_loss = 0.0
         total_count = 0
 
-        iterator = tqdm(
-            loader,
-            desc=f"Reranker | epoch={epoch:03d} | phase={phase}",
-            ncols=100,
-        )
+        iterator = tqdm(loader, desc=f"Reranker(listwise) | epoch={epoch:03d} | phase={phase}")
 
         for batch in iterator:
-            q_imgs = batch["q_img"]
-            c_imgs = batch["c_img"]
-            targets = torch.as_tensor(batch["target"], dtype=torch.float32, device=self.device)
+            q_emb = batch["q_emb"].to(self.device, non_blocking=True)      # (B,D)
+            c_emb = batch["c_emb"].to(self.device, non_blocking=True)      # (B,K,D)
+            p_gt  = batch["gt_prob"].to(self.device, non_blocking=True)    # (B,K)
+            mask  = batch["mask"].to(self.device, non_blocking=True)       # (B,K)
 
-            with torch.no_grad():
-                q_emb = self.model.encode_batch(q_imgs)
-                c_emb = self.model.encode_batch(c_imgs)
+            # ensure p_gt is valid / normalized over mask (defensive)
+            p_gt = torch.where(mask, p_gt, torch.zeros_like(p_gt))
+            denom = p_gt.sum(dim=1, keepdim=True).clamp_min(1e-12)
+            p_gt = p_gt / denom
 
-            preds = self.model(q_emb, c_emb)
-            loss = self.criterion(preds, targets)
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                logits = self.model(q_emb, c_emb)  # (B,K)
+                log_q = masked_log_softmax(logits, mask, dim=1)  # (B,K)
+                loss = -(p_gt * log_q).sum(dim=1).mean()
 
             if train:
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.cfg.grad_clip_norm))
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(self.cfg.grad_clip_norm))
+                    self.optimizer.step()
 
-            bs = targets.shape[0]
+            bs = int(q_emb.shape[0])
             total_loss += float(loss.item()) * bs
             total_count += bs
 
-            iterator.set_postfix(loss=float(loss.item()))
+            iterator.set_postfix_str(f"loss={total_loss / max(total_count,1):.6f}")
 
         return total_loss / max(total_count, 1)
 
+    def _save_history_csv(self, history: List[Dict[str, float]], best_val: float, test_loss: float) -> None:
+        out_path = Path(self.cfg.out_path)
+        hist_path = out_path.with_suffix(".history.csv")
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
 
+        with hist_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss"])
+            writer.writeheader()
+            for row in history:
+                writer.writerow(row)
+
+        print(
+            "[Reranker] Saved loss history:\n"
+            f"  - path            : {hist_path}\n"
+            f"  - best_val_loss   : {best_val:.6f}\n"
+            f"  - final_test_loss : {test_loss:.6f}"
+        )

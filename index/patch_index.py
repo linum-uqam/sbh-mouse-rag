@@ -375,8 +375,10 @@ class PatchIndexBuilder:
         thr = lo + float(cfg.bg_threshold) * (hi - lo)
 
         img = slc.image
-        mask = (img > thr).astype(np.uint8)  # (H,W) in {0,1}
-        integral = mask.cumsum(axis=0).cumsum(axis=1)      # same shape
+        # Binary mask in {0,1}
+        mask = (img > thr).astype(np.uint8)
+        integral = mask.cumsum(axis=0, dtype=np.int32).cumsum(axis=1, dtype=np.int32)
+
         return mask, integral
 
     @staticmethod
