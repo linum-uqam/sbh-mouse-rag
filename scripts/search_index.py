@@ -11,7 +11,7 @@ from index.store import IndexStore
 from index.search import SliceSearcher, SearchConfig, SearchResult
 from index.utils import log, load_image_gray
 from index.config import OUT_DIR
-from index.vis import save_search_results_visuals
+from index.vis import save_search_results_visuals, save_hits_only_images
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -142,7 +142,14 @@ def main() -> None:
 
     # 4) Optionally save visuals
     if args.save_dir is not None:
-        save_search_results_visuals(hits, query_img, args.save_dir)
+        # save_search_results_visuals(hits, query_img, args.save_dir)
+        save_hits_only_images(
+            hits,
+            out_dir=Path(args.save_dir),
+            mode="patch",   # <-- change to "full" if you want full slices
+            top_n=len(hits),
+            verbose=True,
+        )
 
         save_dir = Path(args.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)

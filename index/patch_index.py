@@ -1,7 +1,7 @@
 # index/patch_index.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Iterator
 
@@ -27,6 +27,9 @@ from .config import (
     HNSW_EF_CONSTRUCTION,
     PQ_M,
     PQ_BITS,
+    FIXED_ROTATIONS,
+    FIXED_STEP_VOX,
+    FIXED_MARGIN_VOX,
 )
 
 
@@ -37,11 +40,19 @@ from .config import (
 @dataclass
 class PatchSamplingConfig:
     """
-    Configuration for how we sample patches from each slice.
+    Configuration for how we sample slices + patches for indexing.
     """
+    # Slice extraction
+    depth_step_vox: float = float(FIXED_STEP_VOX)
+    depth_margin_vox: float = float(FIXED_MARGIN_VOX)
+    rotations_deg: Tuple[float, ...] = field(default_factory=lambda: tuple(float(r) for r in FIXED_ROTATIONS))
+
+    # Patch extraction
     slice_size_px: int = SLICE_SIZE
     patch_scales: Tuple[int, ...] = PATCH_SCALES
     patch_overlap: float = PATCH_OVERLAP
+
+    # Filtering / metadata / batching
     bg_threshold: float = 0.05       # pixel intensity threshold for foreground
     min_fg_ratio: float = 0.05       # minimum foreground ratio for a patch
     resolution_um: int = 25          # for metadata only
@@ -62,6 +73,7 @@ class IndexConfig:
     pq_m: int = PQ_M
     pq_bits: int = PQ_BITS
     max_train_vectors: int = 200_000   # cap for IVFPQ training sample
+
 
 @dataclass
 class PatchMeta:
@@ -95,6 +107,7 @@ class PatchMeta:
 
     # patch center in voxel space (one logical field)
     center_xyz_vox: tuple[float, float, float]
+
 
 # ----------------------------------------------------------------------
 # FAISS index manager
@@ -248,8 +261,8 @@ class PatchIndexBuilder:
         → FAISS index + manifest
 
     Public API:
-      - build() -> (faiss.Index, pandas.DataFrame)
-      - save(index, df, out_dir) -> (index_path, manifest_path)
+      - build() -> (faiss.Index, pandas.DataFrame, np.ndarray)
+      - save(index, df, vectors, out_dir) -> (index_path, manifest_path)
       - run(out_dir) -> (index_path, manifest_path)
     """
 
@@ -356,7 +369,7 @@ class PatchIndexBuilder:
 
         per_slice = sum(per_scale.values())
         return total_slices * per_slice, per_scale
-    
+
     # ---------- patch validity (slice-level mask + integral) ----------
 
     def _build_slice_mask_and_integral(
@@ -375,7 +388,6 @@ class PatchIndexBuilder:
         thr = lo + float(cfg.bg_threshold) * (hi - lo)
 
         img = slc.image
-        # Binary mask in {0,1}
         mask = (img > thr).astype(np.uint8)
         integral = mask.cumsum(axis=0, dtype=np.int32).cumsum(axis=1, dtype=np.int32)
 
@@ -391,8 +403,6 @@ class PatchIndexBuilder:
     ) -> float:
         """
         Compute foreground ratio for [y0:y1, x0:x1) using an integral image.
-
-        integral[y,x] = sum(mask[0:y, 0:x]) inclusive.
         """
         if x0 >= x1 or y0 >= y1:
             return 0.0
@@ -412,7 +422,7 @@ class PatchIndexBuilder:
         return float(fg_count) / float(area)
 
     # ---------- per-slice patch iterator ----------
-    
+
     def _iter_patches_for_slice(
         self,
         slc,
@@ -421,10 +431,6 @@ class PatchIndexBuilder:
         """
         Given a Slice + its pose metadata, yield (patch_img, PatchMeta) pairs
         for all valid patches across all scales.
-
-        Uses:
-          - precomputed patch grids per scale
-          - slice-level integral image for fast foreground ratio
         """
         img = slc.image
         slice_size = self.sampling_cfg.slice_size_px
@@ -436,7 +442,6 @@ class PatchIndexBuilder:
         depth_vox = float(meta["depth_vox"])
         rotation_deg = float(meta["rotation_deg"])
 
-        # Build mask + integral *once* per slice
         _, integral = self._build_slice_mask_and_integral(slc)
         min_fg = float(self.sampling_cfg.min_fg_ratio)
 
@@ -447,18 +452,15 @@ class PatchIndexBuilder:
                 continue
 
             for (iy, ix, y0, y1, x0, x1) in coords:
-                # Safety check for unexpected slice size
                 if y1 > slice_size or x1 > slice_size:
                     continue
 
-                # Fast foreground ratio via integral image
                 fg_ratio = self._fg_ratio_from_integral(integral, x0, y0, x1, y1)
                 if fg_ratio < min_fg:
                     continue
 
                 patch = img[y0:y1, x0:x1]
 
-                # center in slice pixel coordinates
                 cx_px = (x0 + x1 - 1) / 2.0
                 cy_px = (y0 + y1 - 1) / 2.0
 
@@ -569,29 +571,34 @@ class PatchIndexBuilder:
         """
         slice_size = self.sampling_cfg.slice_size_px
 
-        # Normalize volume once
         if not self.vol.is_normalized():
             log("slices", ["Normalizing volume to [0,1] once..."])
             self.vol.normalize_volume()
 
-        # Get iterator and total_slices
+        # Slice iterator + total slice count (includes rotations_deg)
         it, total_slices = iter_slices_fibonacci(
             self.vol,
             k_normals=self.k_normals,
             size_px=slice_size,
             linear_interp=True,
             include_annotation=False,
+            step_vox=float(self.sampling_cfg.depth_step_vox),
+            margin_vox=float(self.sampling_cfg.depth_margin_vox),
+            rotations_deg=tuple(self.sampling_cfg.rotations_deg),
         )
 
         est_total_patches, per_scale = self._estimate_total_patches(total_slices)
 
         log("slices", [
-            f"K_NORMALS        : {self.k_normals}",
-            f"SLICE_SIZE       : {slice_size}",
-            f"PATCH_SCALES     : {self.sampling_cfg.patch_scales}",
-            f"PATCH_OVERLAP    : {self.sampling_cfg.patch_overlap}",
-            f"Total slices     : {total_slices}",
-            "Per-slice patches: "
+            f"K_NORMALS           : {self.k_normals}",
+            f"SLICE_SIZE          : {slice_size}",
+            f"DEPTH_STEP_VOX      : {self.sampling_cfg.depth_step_vox}",
+            f"DEPTH_MARGIN_VOX    : {self.sampling_cfg.depth_margin_vox}",
+            f"ROTATIONS_DEG (n)   : {len(self.sampling_cfg.rotations_deg)}",
+            f"PATCH_SCALES        : {self.sampling_cfg.patch_scales}",
+            f"PATCH_OVERLAP       : {self.sampling_cfg.patch_overlap}",
+            f"Total slices        : {total_slices}",
+            "Per-slice patches   : "
             + ", ".join(f"s={s} -> {per_scale[s]}" for s in self.sampling_cfg.patch_scales),
             f"Estimated total patches: {est_total_patches}",
         ])
@@ -614,11 +621,9 @@ class PatchIndexBuilder:
         )
 
         for slc, meta in bar:
-            # Fast reject of mostly empty slices
             if not self.vol.is_valid_slice(slc):
                 continue
 
-            # Delegate all patch logic to the generator
             for patch, pmeta in self._iter_patches_for_slice(slc, meta):
                 patch_buf.append(patch.astype(np.float32, copy=False))
                 meta_buf.append(pmeta)
@@ -630,7 +635,6 @@ class PatchIndexBuilder:
                         next_id,
                     )
 
-        # Flush any remaining patches
         next_id = self._flush_batch(
             patch_buf, meta_buf,
             all_vecs, all_ids, rows,
@@ -676,7 +680,6 @@ class PatchIndexBuilder:
         faiss.write_index(index, str(index_path))
         df.to_parquet(manifest_path, index=False)
 
-        # save embedding matrix
         np.save(vectors_path, vectors.astype(np.float32, copy=False))
 
         log("index", [

@@ -10,6 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import numpy as np
+from PIL import Image
 
 from volume.volume_helper import AllenVolume
 from index.search import SearchResult
@@ -112,3 +113,67 @@ def save_search_results_visuals(
         fig.tight_layout()
         fig.savefig(out_dir / fname, dpi=150, bbox_inches="tight")
         plt.close(fig)
+
+
+def _save_gray_png(arr: np.ndarray, path: Path) -> None:
+    """Save (H,W) float array in [0,1] as an 8-bit grayscale PNG."""
+    arr = np.clip(arr, 0.0, 1.0)
+    im = Image.fromarray((arr * 255.0).astype(np.uint8), mode="L")
+    im.save(path)
+
+def save_hits_only_images(
+    hits: List[SearchResult],
+    out_dir: Path | str,
+    allen: AllenVolume | None = None,
+    mode: str = "patch",           # "patch" or "full"
+    top_n: int | None = None,
+    verbose: bool = True,
+) -> None:
+    """
+    Save plain images (no formatting) for hits, ordered by rank.
+
+    mode="patch" saves the cropped patch (x0:y1, x0:x1).
+    mode="full"  saves the reconstructed full slice.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if allen is None:
+        allen = AllenVolume(cache_dir="volume/data/allen", resolution_um=25)
+
+    if top_n is None:
+        top_n = len(hits)
+
+    if verbose:
+        log("hits_only", [f"Saving {min(top_n, len(hits))} image(s) to: {out_dir} (mode={mode})"])
+
+    for rank, hit in enumerate(hits[:top_n], start=1):
+        m = hit.meta
+
+        normal = (float(m["normal_x"]), float(m["normal_y"]), float(m["normal_z"]))
+        depth = float(m["depth_vox"])
+        rot = float(m["rotation_deg"])
+
+        x0 = int(m["x0"]); y0 = int(m["y0"]); x1 = int(m["x1"]); y1 = int(m["y1"])
+
+        # Reconstruct slice from Allen volume
+        sl = allen.get_slice(
+            normal=normal,
+            depth=depth,
+            rotation=rot,
+            size=SLICE_SIZE,
+            pixel=1.0,
+            linear_interp=True,
+            include_annotation=False,
+        )
+        full_img = sl.normalized().image  # (H,W) in [0,1]
+
+        if mode == "patch":
+            img_out = full_img[y0:y1, x0:x1]
+        elif mode == "full":
+            img_out = full_img
+        else:
+            raise ValueError(f"Unknown mode={mode}. Use 'patch' or 'full'.")
+
+        fname = f"hit_{rank:02d}_pid{hit.patch_id}_score{hit.score:.4f}.png"
+        _save_gray_png(img_out, out_dir / fname)

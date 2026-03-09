@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 from pathlib import Path
+from typing import Sequence
 
 import faiss
 
@@ -17,8 +18,17 @@ from index.config import (
     PATCH_OVERLAP,
     INDEX_STRATEGY,
     D,
+    FIXED_STEP_VOX,
+    FIXED_MARGIN_VOX,
+    FIXED_ROTATIONS,
 )
 from index.utils import log
+
+
+def _parse_rotations(vals: Sequence[float]) -> tuple[float, ...]:
+    rots = tuple(float(v) for v in vals)
+    # Keep pipeline valid: at least one rotation
+    return rots if len(rots) > 0 else (0.0,)
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +67,28 @@ def parse_args() -> argparse.Namespace:
         default=PATCH_OVERLAP,
         help=f"Patch overlap ratio in (0,1), e.g. 0.5 for 50%% (default: {PATCH_OVERLAP})",
     )
+
+    # depth/rotation controls (slice sampling)
+    parser.add_argument(
+        "--depth-step-vox",
+        type=float,
+        default=float(FIXED_STEP_VOX),
+        help=f"Depth sampling step along normal, in voxels (default: {FIXED_STEP_VOX})",
+    )
+    parser.add_argument(
+        "--depth-margin-vox",
+        type=float,
+        default=float(FIXED_MARGIN_VOX),
+        help=f"Margin removed from depth bounds, in voxels (default: {FIXED_MARGIN_VOX})",
+    )
+    parser.add_argument(
+        "--rotations-deg",
+        type=float,
+        nargs="+",
+        default=list(FIXED_ROTATIONS),
+        help=f"In-plane rotations (degrees) applied per (normal, depth) (default: {FIXED_ROTATIONS})",
+    )
+
     parser.add_argument(
         "--index-strategy",
         type=str,
@@ -71,17 +103,30 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # Basic validation
+    if not (0.0 < float(args.patch_overlap) < 1.0):
+        raise ValueError("--patch-overlap must be in (0,1)")
+    if float(args.depth_step_vox) <= 0.0:
+        raise ValueError("--depth-step-vox must be > 0")
+    if float(args.depth_margin_vox) < 0.0:
+        raise ValueError("--depth-margin-vox must be >= 0")
+
+    rotations_deg = _parse_rotations(args.rotations_deg)
+
     # Use most CPU cores but leave 1 free.
     faiss.omp_set_num_threads(max(1, mp.cpu_count() - 1))
 
     log("main", [
         "Starting patch index creation...",
-        f"OUT_DIR        : {args.out_dir}",
-        f"K_NORMALS      : {args.k_normals}",
-        f"SLICE_SIZE     : {args.slice_size}",
-        f"PATCH_SCALES   : {tuple(args.patch_scales)}",
-        f"PATCH_OVERLAP  : {args.patch_overlap}",
-        f"INDEX_STRATEGY : {args.index_strategy}",
+        f"OUT_DIR          : {args.out_dir}",
+        f"K_NORMALS        : {args.k_normals}",
+        f"SLICE_SIZE       : {args.slice_size}",
+        f"PATCH_SCALES     : {tuple(args.patch_scales)}",
+        f"PATCH_OVERLAP    : {args.patch_overlap}",
+        f"DEPTH_STEP_VOX   : {args.depth_step_vox}",
+        f"DEPTH_MARGIN_VOX : {args.depth_margin_vox}",
+        f"ROTATIONS_DEG    : {rotations_deg} (n={len(rotations_deg)})",
+        f"INDEX_STRATEGY   : {args.index_strategy}",
     ])
 
     # 1) Load Allen volume
@@ -89,20 +134,23 @@ def main() -> None:
 
     # 2) Build configs
     sampling_cfg = PatchSamplingConfig(
-        slice_size_px=args.slice_size,
-        patch_scales=tuple(args.patch_scales),
-        patch_overlap=args.patch_overlap,
+        depth_step_vox=float(args.depth_step_vox),
+        depth_margin_vox=float(args.depth_margin_vox),
+        rotations_deg=tuple(rotations_deg),
+        slice_size_px=int(args.slice_size),
+        patch_scales=tuple(int(s) for s in args.patch_scales),
+        patch_overlap=float(args.patch_overlap),
     )
 
     index_cfg = IndexConfig(
-        dim=D,
-        strategy=args.index_strategy,
+        dim=int(D),
+        strategy=str(args.index_strategy),
     )
 
     # 3) Build & save index
     builder = PatchIndexBuilder(
         vol_helper=allen,
-        k_normals=args.k_normals,
+        k_normals=int(args.k_normals),
         sampling_cfg=sampling_cfg,
         index_cfg=index_cfg,
     )
@@ -111,8 +159,8 @@ def main() -> None:
 
     log("main", [
         "Patch index creation complete.",
-        f"Index saved   : {index_path}",
-        f"Manifest saved: {manifest_path}",
+        f"Index saved    : {index_path}",
+        f"Manifest saved : {manifest_path}",
     ])
 
 

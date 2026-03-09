@@ -16,6 +16,12 @@ SLICE_SIZE = 512        # square slice size in pixels
 # scale = 8  -> 8x8 base tiles
 PATCH_SCALES = (1, 2, 4) # ,8
 
+# ------------------------- Geometry (fixed sampling) ------------
+FIXED_ROTATIONS = [0.0]
+FIXED_PIXEL_STEP_VOX = 1.0
+FIXED_STEP_VOX = 10.0
+FIXED_MARGIN_VOX = 0.0
+
 # Overlap ratio between neighbouring windows (0.5 = 50% overlap)
 PATCH_OVERLAP = 0.25
 
@@ -41,8 +47,3 @@ HNSW_EF_CONSTRUCTION = 200
 PQ_M = 16
 PQ_BITS = 8
 
-# ------------------------- Geometry (fixed sampling) ------------
-FIXED_ROTATIONS = [0.0]
-FIXED_PIXEL_STEP_VOX = 1.0
-FIXED_STEP_VOX = 10.0
-FIXED_MARGIN_VOX = 0.0
