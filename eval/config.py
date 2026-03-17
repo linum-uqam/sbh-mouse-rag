@@ -46,7 +46,7 @@ class EvalConfig:
     tau_min: float = 1e-3
     tau_max: float = 1e4
 
-    # -------- Optional reranker passthrough (kept, but not required) --------
+    # -------- Optional reranker passthrough --------
     use_reranker: bool = False
     rerank_topk: Optional[int] = None
     reranker_model_path: Path = Path("out/reranker/reranker.pt")
@@ -57,3 +57,11 @@ class EvalConfig:
     save_dir: Path = Path("out/eval")
     save_k: Optional[int] = None
     save_seed: int = 42
+
+    # -------- Resume / overwrite --------
+    overwrite: bool = False
+
+    # -------- Memory / streaming safety --------
+    max_retrieved_slice_cache: int = 256
+    csv_flush_every: int = 128
+    gc_every_rows: int = 25

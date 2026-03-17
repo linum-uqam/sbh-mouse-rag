@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-k", type=int, default=None, help="Save exactly K random rows of visuals (optional).")
     p.add_argument("--save-seed", type=int, default=123, help="Seed for selecting which rows to visualize.")
 
+    # -------------------- Resume / overwrite / memory --------------------
+    p.add_argument("--overwrite", action="store_true", help="Delete/recreate eval_hits.csv before starting.")
+    p.add_argument("--max-retrieved-slice-cache", type=int, default=256, help="Max number of reconstructed Allen plane slices kept in RAM.")
+    p.add_argument("--csv-flush-every", type=int, default=128, help="Flush CSV every N written rows.")
+    p.add_argument("--gc-every-rows", type=int, default=25, help="Run gc.collect() every N processed dataset rows.")
+
     return p.parse_args()
 
 
@@ -106,6 +112,12 @@ def main() -> None:
         save_dir=Path(a.save_dir) if a.save_dir else EvalConfig.save_dir,
         save_k=a.save_k,
         save_seed=a.save_seed,
+
+        # resume / overwrite / memory
+        overwrite=a.overwrite,
+        max_retrieved_slice_cache=a.max_retrieved_slice_cache,
+        csv_flush_every=a.csv_flush_every,
+        gc_every_rows=a.gc_every_rows,
     )
 
     Evaluator(cfg).run()

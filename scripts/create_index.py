@@ -97,6 +97,18 @@ def parse_args() -> argparse.Namespace:
         help=f"Index strategy (default: {INDEX_STRATEGY})",
     )
 
+    parser.add_argument(
+        "--save-patch-images",
+        action="store_true",
+        help="Save each indexed patch as a PNG file",
+    )
+    parser.add_argument(
+        "--patch-image-dirname",
+        type=str,
+        default="patch_png",
+        help="Subdirectory name used to save patch PNGs",
+    )
+
     return parser.parse_args()
 
 
@@ -140,6 +152,8 @@ def main() -> None:
         slice_size_px=int(args.slice_size),
         patch_scales=tuple(int(s) for s in args.patch_scales),
         patch_overlap=float(args.patch_overlap),
+        save_patch_images=bool(args.save_patch_images),
+        patch_image_dirname=str(args.patch_image_dirname),
     )
 
     index_cfg = IndexConfig(

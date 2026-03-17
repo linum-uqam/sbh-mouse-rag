@@ -11,6 +11,10 @@ eval_out/*
 results/*
 out/*
 todo
+*index*
+*secrets*
+*paper*
+
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

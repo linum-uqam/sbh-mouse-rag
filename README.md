@@ -20,7 +20,11 @@ python -m scripts.create_dataset
 
 ## Index
 ```bash
+# Build index (without saving images)
 python -m scripts.create_index # --k-normals 16 --slice-size 512 --patch-scales 1 2 4 --patch-overlap 0.25
+
+# Build index with the images (usefull for precompute the slices)
+python -m scripts.create_index --save-patch-images --patch-image-dirname patch_png
 ```
 
 ## Search
@@ -165,3 +169,15 @@ python scripts/register/find_best_orientation.py \
   --subsample 4
 python scripts/register/view_registration_napari.py
 ```
+
+# Other scripts
+
+figs 
+
+```bash
+python -m scripts.tests.rotation_problem out/dataset/data/00009_a_crop0.png --out out/top1_vs_rot180.png
+python scripts/paper/make_pipeline_figure.py 
+```
+
+
+

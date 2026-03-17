@@ -9,6 +9,7 @@ import faiss
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
+from PIL import Image
 
 from volume.volume_helper import VolumeHelper
 from index.geom import iter_slices_fibonacci, count_slices_fibonacci
@@ -57,6 +58,10 @@ class PatchSamplingConfig:
     min_fg_ratio: float = 0.05       # minimum foreground ratio for a patch
     resolution_um: int = 25          # for metadata only
     batch_size: int = 64             # batch size for DINO embeddings
+
+    # Optional patch image export
+    save_patch_images: bool = False
+    patch_image_dirname: str = "patch_png"
 
 
 @dataclass
@@ -285,8 +290,30 @@ class PatchIndexBuilder:
         self._patch_grids: Dict[int, List[Tuple[int, int, int, int, int, int]]] = {}
         self._build_patch_grids()
 
-    # ---------- geometry helpers ----------
 
+    @staticmethod
+    def _patch_to_uint8(patch: np.ndarray) -> np.ndarray:
+        arr = np.asarray(patch, dtype=np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+        arr = (arr * 255.0).round().astype(np.uint8)
+        return arr
+
+    def _save_patch_image(
+        self,
+        patch: np.ndarray,
+        pid: int,
+        patch_img_dir: Path,
+    ) -> str:
+        patch_img_dir.mkdir(parents=True, exist_ok=True)
+        image_name = f"{pid:08d}.png"
+        image_path = patch_img_dir / image_name
+
+        arr_u8 = self._patch_to_uint8(patch)
+        Image.fromarray(arr_u8, mode="L").save(image_path)
+
+        return image_name
+    
+    # ---------- geometry helpers ----------
     def _build_patch_grids(self) -> None:
         """
         Precompute patch coordinates for each scale once, based on:
@@ -506,66 +533,66 @@ class PatchIndexBuilder:
         all_ids: List[int],
         rows: List[Dict],
         next_id: int,
+        patch_img_dir: Path | None = None,
     ) -> int:
-        """
-        Embed all patches in patch_buf as a batch, create rows & IDs, and
-        append to all_vecs / all_ids / rows. Returns updated next_id.
-        """
         if not patch_buf:
             return next_id
 
-        embs = model.embed_batch(patch_buf)  # (B,D)
+        embs = model.embed_batch(patch_buf)
         if embs.shape[1] != self.index_cfg.dim:
             raise ValueError(
                 f"DINO embed_batch dim {embs.shape[1]} != index_cfg.dim={self.index_cfg.dim}"
             )
 
-        for emb, meta in zip(embs, meta_buf):
+        save_imgs = bool(self.sampling_cfg.save_patch_images) and patch_img_dir is not None
+
+        for patch, emb, meta in zip(patch_buf, embs, meta_buf):
             pid = next_id
             next_id += 1
 
             all_vecs.append(emb.astype(np.float32, copy=False))
             all_ids.append(pid)
 
-            rows.append(
-                {
-                    "id": pid,
-                    # slice pose (3D)
-                    "normal_idx": meta.normal_idx,
-                    "depth_idx": meta.depth_idx,
-                    "rot_idx": meta.rot_idx,
-                    "normal_x": meta.normal_x,
-                    "normal_y": meta.normal_y,
-                    "normal_z": meta.normal_z,
-                    "depth_vox": meta.depth_vox,
-                    "rotation_deg": meta.rotation_deg,
-                    # patch-level info
-                    "scale": meta.scale,
-                    "patch_row": meta.patch_row,
-                    "patch_col": meta.patch_col,
-                    "x0": meta.x0,
-                    "y0": meta.y0,
-                    "x1": meta.x1,
-                    "y1": meta.y1,
-                    "patch_h": meta.patch_h,
-                    "patch_w": meta.patch_w,
-                    # global slice info
-                    "slice_size_px": meta.slice_size_px,
-                    "resolution_um": meta.resolution_um,
-                    # patch 3D center
-                    "center_x_vox": meta.center_xyz_vox[0],
-                    "center_y_vox": meta.center_xyz_vox[1],
-                    "center_z_vox": meta.center_xyz_vox[2],
-                }
-            )
+            row = {
+                "id": pid,
+                "normal_idx": meta.normal_idx,
+                "depth_idx": meta.depth_idx,
+                "rot_idx": meta.rot_idx,
+                "normal_x": meta.normal_x,
+                "normal_y": meta.normal_y,
+                "normal_z": meta.normal_z,
+                "depth_vox": meta.depth_vox,
+                "rotation_deg": meta.rotation_deg,
+                "scale": meta.scale,
+                "patch_row": meta.patch_row,
+                "patch_col": meta.patch_col,
+                "x0": meta.x0,
+                "y0": meta.y0,
+                "x1": meta.x1,
+                "y1": meta.y1,
+                "patch_h": meta.patch_h,
+                "patch_w": meta.patch_w,
+                "slice_size_px": meta.slice_size_px,
+                "resolution_um": meta.resolution_um,
+                "center_x_vox": meta.center_xyz_vox[0],
+                "center_y_vox": meta.center_xyz_vox[1],
+                "center_z_vox": meta.center_xyz_vox[2],
+            }
+
+            if save_imgs:
+                image_name = self._save_patch_image(patch, pid, patch_img_dir)
+                row["image_name"] = image_name
+                row["image_relpath"] = f"{self.sampling_cfg.patch_image_dirname}/{image_name}"
+
+            rows.append(row)
 
         patch_buf.clear()
         meta_buf.clear()
         return next_id
-
+    
     # ---------- main build ----------
 
-    def build(self) -> Tuple[faiss.Index, pd.DataFrame, np.ndarray]:
+    def build(self, out_dir: Path | None = None) -> Tuple[faiss.Index, pd.DataFrame, np.ndarray]:
         """
         Run the full pipeline in-memory. Does NOT write to disk.
         """
@@ -574,6 +601,12 @@ class PatchIndexBuilder:
         if not self.vol.is_normalized():
             log("slices", ["Normalizing volume to [0,1] once..."])
             self.vol.normalize_volume()
+            
+        patch_img_dir = None
+        if self.sampling_cfg.save_patch_images:
+            if out_dir is None:
+                raise ValueError("out_dir must be provided when save_patch_images=True")
+            patch_img_dir = Path(out_dir) / self.sampling_cfg.patch_image_dirname
 
         # Slice iterator + total slice count (includes rotations_deg)
         it, total_slices = iter_slices_fibonacci(
@@ -633,12 +666,14 @@ class PatchIndexBuilder:
                         patch_buf, meta_buf,
                         all_vecs, all_ids, rows,
                         next_id,
+                        patch_img_dir=patch_img_dir,
                     )
 
         next_id = self._flush_batch(
             patch_buf, meta_buf,
             all_vecs, all_ids, rows,
             next_id,
+            patch_img_dir=patch_img_dir,
         )
 
         n_vecs = len(all_vecs)
@@ -702,7 +737,7 @@ class PatchIndexBuilder:
         """
         Full pipeline: build in memory, then write to disk.
         """
-        index, df, X = self.build()
+        index, df, X = self.build(out_dir=out_dir)
         return self.save(
             index,
             df,
