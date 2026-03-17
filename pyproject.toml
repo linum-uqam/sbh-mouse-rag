@@ -5,21 +5,71 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sbh-mouse-rag"
 version = "0.0.0"
-requires-python = "==3.11.*"
+requires-python = ">=3.11,<3.12"
 dependencies = [
-  "numpy<1.24",
-  "scipy<1.11",
-  "pandas", "tqdm", "pillow", "requests", "pyyaml", "python-dotenv", "opencv-python",
-  "torch", "torchvision", "torchaudio",
-  "transformers", "tokenizers", "accelerate", "sentence-transformers", "huggingface-hub", "safetensors", "timm",
+  "numpy>=1.26,<3",
+  "scipy",
+  "pandas",
+  "tqdm",
+  "pillow",
+  "requests",
+  "pyyaml",
+  "python-dotenv",
+  "opencv-python",
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "transformers",
+  "tokenizers",
+  "accelerate",
+  "sentence-transformers",
+  "huggingface-hub",
+  "safetensors",
+  "timm",
   "faiss-cpu",
-  "scikit-image", "imageio", "tifffile",
-  "monai", "simpleitk", "nibabel", "allensdk>=2.16",
-  "fastapi", "uvicorn[standard]", "pydantic", "pydantic-settings",
-  "SQLAlchemy", "psycopg2-binary",
-  "mlflow", "optuna",
+  "scikit-image",
+  "imageio",
+  "tifffile",
   "scikit-learn",
   "google-cloud-storage"
+]
+
+[project.optional-dependencies]
+allen = [
+  "numpy<1.24",
+  "allensdk>=2.16",
+  "simpleitk",
+  "nibabel",
+  "monai"
+]
+
+api = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "pydantic-settings",
+  "SQLAlchemy",
+  "psycopg2-binary"
+]
+
+research = [
+  "mlflow",
+  "optuna"
+]
+
+full = [
+  "allensdk>=2.16",
+  "simpleitk",
+  "nibabel",
+  "monai",
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic",
+  "pydantic-settings",
+  "SQLAlchemy",
+  "psycopg2-binary",
+  "mlflow",
+  "optuna"
 ]
 
 [tool.setuptools]
