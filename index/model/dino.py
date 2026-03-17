@@ -3,30 +3,19 @@ from __future__ import annotations
 
 import os
 from typing import Iterable, List, Dict
+
 import numpy as np
 from PIL import Image
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoModel
 
 
 class _HFVisionEncoder:
-    """
-    Minimal DINOv3 wrapper (ViT-Base/16 by default) with:
-      - embed(img_np) -> (D,)
-      - embed_tokens(img_np) -> (T,D)  [patch tokens only; no CLS; T = H*W]
-      - embed_tokens_batch(imgs_np, pool=2) -> (B,T,D) [optionally pooled token grid]
-      - embed_both(img_np) -> {"global": (D,), "tokens": (T,D)}
-      - embed_batch(imgs_np) -> (N,D)
-      - embed_pil_batch(pils) -> (N,D)
 
-    Notes
-    -----
-    - Inputs can be grayscale (H,W) or RGB (H,W,3), in [0,1] or [0,255].
-    - Global is L2-normalized. Tokens are L2-normalized row-wise.
-    - Token grid is square with side `grid_hw` (e.g. 14 for 224/16).
-    """
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
 
     def __init__(self, model_id: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"):
         self.model_id = model_id
@@ -38,13 +27,9 @@ class _HFVisionEncoder:
         if not self.hf_token:
             print(
                 "[DINO] Warning: HF_TOKEN is not set. "
-                "Loading a gated Hugging Face model will fail unless the environment is already authenticated."
+                "Gated model loading may fail."
             )
 
-        self.processor = AutoImageProcessor.from_pretrained(
-            model_id,
-            token=self.hf_token,
-        )
         self.encoder = AutoModel.from_pretrained(
             model_id,
             token=self.hf_token,
@@ -54,7 +39,7 @@ class _HFVisionEncoder:
 
         self.image_size = int(getattr(self.encoder.config, "image_size", 224))
         self.patch_size = int(getattr(self.encoder.config, "patch_size", 16))
-        self.grid_hw = self.image_size // self.patch_size  # expected H == W
+        self.grid_hw = self.image_size // self.patch_size
 
         print(
             f"Using {model_id} on {self.device} | "
@@ -65,11 +50,7 @@ class _HFVisionEncoder:
 
     @staticmethod
     def _to_pil_rgb(img_np: np.ndarray) -> Image.Image:
-        """
-        (H,W) or (H,W,1/3) in [0,1] or uint8 -> PIL RGB.
-        Grayscale inputs are expanded to 3 channels.
-        """
-        if img_np.ndim == 2:  # grayscale
+        if img_np.ndim == 2:
             x = img_np
             if x.dtype != np.uint8:
                 x = np.clip(x, 0, 1) * 255.0
@@ -86,19 +67,51 @@ class _HFVisionEncoder:
 
         raise ValueError("Expected (H,W) or (H,W,1/3) numpy array")
 
+    def _preprocess_pil(self, pil: Image.Image) -> torch.Tensor:
+        """
+        Manual preprocessing:
+          - RGB
+          - resize shortest side to image_size
+          - center crop image_size x image_size
+          - [0,1] float
+          - normalize with ImageNet stats
+        Returns: (3,H,W) tensor on CPU float32
+        """
+        pil = pil.convert("RGB")
+
+        w, h = pil.size
+        target = self.image_size
+
+        # Resize shortest side to target while keeping aspect ratio
+        if w < h:
+            new_w = target
+            new_h = int(round(h * (target / w)))
+        else:
+            new_h = target
+            new_w = int(round(w * (target / h)))
+
+        pil = pil.resize((new_w, new_h), resample=Image.BICUBIC)
+
+        # Center crop
+        left = max(0, (new_w - target) // 2)
+        top = max(0, (new_h - target) // 2)
+        pil = pil.crop((left, top, left + target, top + target))
+
+        arr = np.asarray(pil).astype(np.float32) / 255.0  # (H,W,3)
+        x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # (3,H,W)
+
+        mean = torch.tensor(self.IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+        std = torch.tensor(self.IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
+        x = (x - mean) / std
+        return x
+
     def _prep_batch(self, pil_list: List[Image.Image]) -> torch.Tensor:
-        """Processor handles resize/crop/normalize to model expected size."""
-        return self.processor(images=pil_list, return_tensors="pt")["pixel_values"].to(
-            self.device, dtype=self.dtype
-        )
+        batch = torch.stack([self._preprocess_pil(p) for p in pil_list], dim=0)
+        return batch.to(self.device, dtype=self.dtype)
 
     # ---------------- Token utils ----------------
 
     def _patch_tokens_only(self, last_hidden: torch.Tensor) -> torch.Tensor:
-        """
-        last_hidden: (B, L, D)
-        return: (B, H*W, D) with ONLY patch tokens (drop CLS/extras)
-        """
         B, L, D = last_hidden.shape
         need = self.grid_hw * self.grid_hw
 
@@ -116,26 +129,20 @@ class _HFVisionEncoder:
         return patches
 
     def _global_from_hidden(self, last_hidden: torch.Tensor) -> torch.Tensor:
-        """Prefer CLS if present; else mean of patch tokens."""
         B, L, D = last_hidden.shape
         need = self.grid_hw * self.grid_hw
         if L >= need + 1:
-            return last_hidden[:, 0, :]  # CLS
+            return last_hidden[:, 0, :]
         patches = self._patch_tokens_only(last_hidden)
         return patches.mean(dim=1)
 
     @torch.inference_mode()
     def _forward(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Returns dict of tensors on CPU float32:
-          - global: (B,D)
-          - tokens: (B, H*W, D)
-        """
         out = self.encoder(pixel_values=pixel_values)
-        hidden = out.last_hidden_state  # (B, L, D)
+        hidden = out.last_hidden_state
 
-        g = self._global_from_hidden(hidden)   # (B,D)
-        p = self._patch_tokens_only(hidden)    # (B, H*W, D)
+        g = self._global_from_hidden(hidden)
+        p = self._patch_tokens_only(hidden)
 
         g = F.normalize(g, p=2, dim=-1).to(dtype=torch.float32).cpu()
         p = F.normalize(p, p=2, dim=-1).to(dtype=torch.float32).cpu()
@@ -146,13 +153,13 @@ class _HFVisionEncoder:
     def embed(self, img_np: np.ndarray) -> np.ndarray:
         pil = self._to_pil_rgb(img_np)
         batch = self._prep_batch([pil])
-        feats = self._forward(batch)["global"]  # (1,D)
+        feats = self._forward(batch)["global"]
         return feats.squeeze(0).numpy()
 
     def embed_tokens(self, img_np: np.ndarray) -> np.ndarray:
         pil = self._to_pil_rgb(img_np)
         batch = self._prep_batch([pil])
-        toks = self._forward(batch)["tokens"]  # (1,T,D)
+        toks = self._forward(batch)["tokens"]
         return toks.squeeze(0).numpy()
 
     def embed_both(self, img_np: np.ndarray) -> Dict[str, np.ndarray]:
@@ -160,26 +167,24 @@ class _HFVisionEncoder:
         batch = self._prep_batch([pil])
         out = self._forward(batch)
         return {
-            "global": out["global"].squeeze(0).numpy(),  # (D,)
-            "tokens": out["tokens"].squeeze(0).numpy(),  # (T,D)
+            "global": out["global"].squeeze(0).numpy(),
+            "tokens": out["tokens"].squeeze(0).numpy(),
         }
 
     def embed_batch(self, imgs_np: Iterable[np.ndarray]) -> np.ndarray:
-        """Global embeddings only -> (N,D)."""
         pils = [self._to_pil_rgb(a) for a in imgs_np]
         if not pils:
             return np.zeros((0, int(self.encoder.config.hidden_size)), dtype=np.float32)
         batch = self._prep_batch(pils)
-        feats = self._forward(batch)["global"]  # (N,D)
+        feats = self._forward(batch)["global"]
         return feats.numpy()
 
     def embed_pil_batch(self, pils: Iterable[Image.Image]) -> np.ndarray:
-        """Global embeddings from PIL batch -> (N,D)."""
         pil_list = list(pils)
         if not pil_list:
             return np.zeros((0, int(self.encoder.config.hidden_size)), dtype=np.float32)
         batch = self._prep_batch(pil_list)
-        feats = self._forward(batch)["global"]  # (N,D)
+        feats = self._forward(batch)["global"]
         return feats.numpy()
 
     @torch.inference_mode()
@@ -190,55 +195,36 @@ class _HFVisionEncoder:
         pool: int = 2,
         out_dtype: np.dtype = np.float16,
     ) -> np.ndarray:
-        """
-        Patch token embeddings for a batch -> (B, T, D)
-
-        pool:
-          - 1: keep 14x14 tokens (T=196)
-          - 2: avg-pool token grid 14x14 -> 7x7 (T=49)  [recommended]
-          - 7: 14x14 -> 2x2 (T=4), etc.
-
-        Output tokens are L2-normalized across D.
-
-        Returns numpy array on CPU (float16 by default).
-        """
         pils = [self._to_pil_rgb(a) for a in imgs_np]
         if not pils:
             return np.zeros((0, 0, int(self.encoder.config.hidden_size)), dtype=out_dtype)
 
-        pixel_values = self._prep_batch(pils)  # (B,3,224,224) on device/dtype
+        pixel_values = self._prep_batch(pils)
         out = self.encoder(pixel_values=pixel_values)
-        hidden = out.last_hidden_state  # (B,L,D) on device/dtype
+        hidden = out.last_hidden_state
 
-        tok = self._patch_tokens_only(hidden)  # (B, 196, D)
+        tok = self._patch_tokens_only(hidden)
         B, N, D = tok.shape
 
         H = W = self.grid_hw
         if N != H * W:
             raise ValueError(f"Unexpected token count N={N} vs grid {H}x{W}")
 
-        if pool is None:
-            pool = 1
-        pool = int(pool)
+        pool = 1 if pool is None else int(pool)
         if pool < 1:
             raise ValueError("pool must be >= 1")
 
         if pool > 1:
-            # reshape to (B,D,H,W) then avg_pool2d
-            tok_2d = tok.reshape(B, H, W, D).permute(0, 3, 1, 2).contiguous()  # (B,D,H,W)
+            tok_2d = tok.reshape(B, H, W, D).permute(0, 3, 1, 2).contiguous()
             tok_2d = F.avg_pool2d(tok_2d, kernel_size=pool, stride=pool)
             h2, w2 = int(tok_2d.shape[2]), int(tok_2d.shape[3])
-            tok = tok_2d.permute(0, 2, 3, 1).contiguous().reshape(B, h2 * w2, D)  # (B,T,D)
+            tok = tok_2d.permute(0, 2, 3, 1).contiguous().reshape(B, h2 * w2, D)
 
-        # L2 normalize token vectors
         tok = F.normalize(tok, p=2, dim=-1)
-
-        # move to CPU float32 then cast
         tok = tok.to(dtype=torch.float32).cpu().numpy()
         if out_dtype is not None:
             tok = tok.astype(out_dtype, copy=False)
         return tok
 
 
-# Public instance (stable import)
 model = _HFVisionEncoder()
