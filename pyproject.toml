@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sbh-mouse-rag"
 version = "0.0.0"
@@ -17,6 +21,13 @@ dependencies = [
   "scikit-learn",
   "google-cloud-storage"
 ]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["index*", "volume*"]
 
 [tool.uv]
 python-preference = "managed"
