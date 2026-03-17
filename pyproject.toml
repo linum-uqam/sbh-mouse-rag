@@ -19,7 +19,7 @@ dependencies = [
   "torch",
   "torchvision",
   "torchaudio",
-  "transformers",
+  "transformers==4.56.0",
   "tokenizers",
   "accelerate",
   "sentence-transformers",
