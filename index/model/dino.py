@@ -1,7 +1,8 @@
 # index/model/dino.py
 from __future__ import annotations
 
-from typing import Iterable, List, Dict, Optional
+import os
+from typing import Iterable, List, Dict
 import numpy as np
 from PIL import Image
 
@@ -29,11 +30,26 @@ class _HFVisionEncoder:
 
     def __init__(self, model_id: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"):
         self.model_id = model_id
+        self.hf_token = os.getenv("HF_TOKEN")
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
 
-        self.processor = AutoImageProcessor.from_pretrained(model_id)
-        self.encoder = AutoModel.from_pretrained(model_id, dtype=self.dtype)
+        if not self.hf_token:
+            print(
+                "[DINO] Warning: HF_TOKEN is not set. "
+                "Loading a gated Hugging Face model will fail unless the environment is already authenticated."
+            )
+
+        self.processor = AutoImageProcessor.from_pretrained(
+            model_id,
+            token=self.hf_token,
+        )
+        self.encoder = AutoModel.from_pretrained(
+            model_id,
+            token=self.hf_token,
+            torch_dtype=self.dtype,
+        )
         self.encoder.to(self.device).eval()
 
         self.image_size = int(getattr(self.encoder.config, "image_size", 224))
