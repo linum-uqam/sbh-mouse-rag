@@ -89,23 +89,17 @@ class PairMLP(nn.Module):
         else:
             x = torch.cat([q, c], dim=-1)  # (B,K,2D)
 
-        # Optional scalar features (helps anchor “visual similarity” from cosine)
+        # Optional scalar features
         if bool(self.cfg.add_scalar_features):
-            # cosine similarity in [-1,1] (if normalized -> exact cosine)
             cos = (q * c).sum(dim=-1, keepdim=True)  # (B,K,1)
-
-            # norms (if normalized -> ~1, but still ok)
             qn = torch.linalg.vector_norm(q, ord=2, dim=-1, keepdim=True)  # (B,K,1)
             cn = torch.linalg.vector_norm(c, ord=2, dim=-1, keepdim=True)  # (B,K,1)
-
             x = torch.cat([x, cos, qn, cn], dim=-1)  # (B,K,in_dim)
 
         scores = self.net(x).squeeze(-1)  # (B,K)
 
-        # Optional query-dependent scale (stabilizes listwise softmax)
         if self.use_query_scale:
-            # scale per query (B,1) -> expand to (B,K)
-            s = self.q_scale(q_emb).clamp(-5.0, 5.0).exp()  # positive
+            s = self.q_scale(q_emb).clamp(-5.0, 5.0).exp()
             scores = scores * s
 
         return scores
@@ -132,9 +126,17 @@ class ListwiseReranker(nn.Module):
     def load(cls, path: str | Path, map_location: str | torch.device = "cpu") -> "ListwiseReranker":
         path = Path(path)
         obj = torch.load(path, map_location=map_location)
+
         cfg = RerankerConfig.from_dict(obj["cfg"])
+
+        # Force runtime device from map_location instead of using the checkpoint-saved device.
+        runtime_device = str(map_location)
+        cfg.device = runtime_device
+
         model = cls(cfg=cfg)
         model.load_state_dict(obj["state_dict"])
-        model.to(cfg.device)
-        print(f"[Reranker] Loaded from {path}")
+        model.to(runtime_device)
+        model.eval()
+
+        print(f"[Reranker] Loaded from {path} on device={runtime_device}")
         return model
