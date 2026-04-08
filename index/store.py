@@ -134,7 +134,7 @@ class IndexStore:
         if Q.ndim == 1:
             Q = Q.reshape(1, -1)
         Qn = np.asarray(Q, dtype=np.float32).copy()   # copy to avoid in-place mutation
-        Qn = self._normalize_queries(Q)
+        Qn = self._normalize_queries(Qn)
         D, I = self.index.search(Qn, k)
         return D, I
 

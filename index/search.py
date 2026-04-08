@@ -1,4 +1,3 @@
-# index/search.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,7 +24,7 @@ class SearchConfig:
     Configuration for image → patch search.
     """
     angles: Tuple[float, ...] = (0.0, 90.0, 180.0, 270.0)
-    k_per_angle: int = 64
+    k_per_angle: int = 200
     crop_foreground: bool = True
     bg_threshold: float = 0.05
     min_fg_ratio: float = 0.05
@@ -94,6 +93,18 @@ class SliceSearcher:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _slice_key_from_row(row: pd.Series) -> tuple[int, int, int]:
+        """
+        Unique key for the indexed source image/slice.
+        Many patch_ids can belong to the same source slice.
+        """
+        return (
+            int(row["normal_idx"]),
+            int(row["depth_idx"]),
+            int(row["rot_idx"]),
+        )
+
     def search_image(self, img_np: np.ndarray, k: int = 10) -> Tuple[List[SearchResult], np.ndarray]:
         """
         Search using a query image and return:
@@ -115,8 +126,8 @@ class SliceSearcher:
         # 4) single FAISS call for all rotations at once
         D_all, I_all = self.store.search(G, self.cfg.k_per_angle)  # each (A, k_per_angle)
 
-        # 5) accumulate best coarse score per patch id over all rotations
-        best: Dict[int, Tuple[float, float]] = {}  # patch_id -> (score, angle)
+        # 5) first dedup: keep best score per patch_id across all query rotations
+        best_patch: Dict[int, Tuple[float, float]] = {}  # patch_id -> (score, best_query_angle)
 
         for a_idx, angle in enumerate(angles):
             d_row = D_all[a_idx]
@@ -126,33 +137,66 @@ class SliceSearcher:
                 pid = int(pid)
                 if pid < 0:
                     continue
-                sc = float(score)
-                if pid not in best or sc > best[pid][0]:
-                    best[pid] = (sc, float(angle))
 
-        if not best:
+                sc = float(score)
+                prev = best_patch.get(pid)
+                if prev is None or sc > prev[0]:
+                    best_patch[pid] = (sc, float(angle))
+
+        if not best_patch:
             return [], q
 
-        # 6) sort by score desc and keep top-k
-        sorted_hits = sorted(best.items(), key=lambda kv: kv[1][0], reverse=True)
+        # 6) second dedup: keep only one best patch per indexed source slice/image
+        candidate_ids = list(best_patch.keys())
+        df_rows = self.store.rows_for_ids(candidate_ids)
+
+        # slice_key -> (patch_id, score, angle)
+        best_slice: Dict[tuple[int, int, int], Tuple[int, float, float]] = {}
+
+        for pid in candidate_ids:
+            row = df_rows.loc[int(pid)]
+
+            # Defensive guard for missing manifest rows
+            if row.isnull().all():
+                continue
+
+            slice_key = self._slice_key_from_row(row)
+            score, angle = best_patch[int(pid)]
+
+            prev = best_slice.get(slice_key)
+            if prev is None or score > prev[1]:
+                best_slice[slice_key] = (int(pid), float(score), float(angle))
+
+        if not best_slice:
+            return [], q
+
+        if self.cfg.verbose:
+            log("search", [
+                f"Candidates before patch dedup : {sum(len(I_all[a]) for a in range(len(angles)))}",
+                f"Unique patch ids              : {len(best_patch)}",
+                f"Unique indexed slices         : {len(best_slice)}",
+            ])
+
+        # 7) sort unique slices by score desc and keep top-k
+        sorted_hits = sorted(best_slice.values(), key=lambda t: t[1], reverse=True)
         top = sorted_hits[: int(k)]
 
-        ids = [pid for pid, _ in top]
-        df_rows = self.store.rows_for_ids(ids)
+        ids = [pid for pid, _, _ in top]
+        df_top = self.store.rows_for_ids(ids)
 
         results: List[SearchResult] = []
-        for pid, (score, angle) in top:
-            row = df_rows.loc[int(pid)]
+        for pid, score, angle in top:
+            row = df_top.loc[int(pid)]
             results.append(
                 SearchResult(
                     patch_id=int(pid),
-                    score=float(score),  # coarse cosine similarity (FAISS)
+                    score=float(score),
                     angle=float(angle),
                     meta=row.to_dict(),
                 )
             )
 
-        # 7) Optional reranking (embedding-only)
+        # 8) Optional reranking
         if self.cfg.use_reranker and self.reranker is not None and results:
             self._apply_reranker(results, G, angles)
 
@@ -252,7 +296,7 @@ class SliceSearcher:
 
         scores = np.asarray(scores, dtype=np.float32)
 
-        # --- NEW: blend reranker + cosine (over the reranked topk) ---
+        # --- blend reranker + cosine (over the reranked topk) ---
         alpha = float(self.cfg.rerank_alpha)
         alpha = float(np.clip(alpha, 0.0, 1.0))
 
