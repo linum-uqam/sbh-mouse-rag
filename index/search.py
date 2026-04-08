@@ -24,6 +24,11 @@ class SearchConfig:
     Configuration for image → patch search.
     """
     angles: Tuple[float, ...] = (0.0, 90.0, 180.0, 270.0)
+
+    # Query augmentations
+    flip_x: bool = False   # horizontal mirror (left-right)
+    flip_y: bool = False   # vertical mirror (top-bottom)
+
     k_per_angle: int = 200
     crop_foreground: bool = True
     bg_threshold: float = 0.05
@@ -61,6 +66,10 @@ class SearchResult:
     angle: float  # query rotation angle that produced this coarse score
     meta: Dict[str, Any]
     rerank_score: float | None = None
+
+    # optional metadata for augmented query provenance
+    flip_x: bool = False
+    flip_y: bool = False
 
 
 class SliceSearcher:
@@ -114,24 +123,34 @@ class SliceSearcher:
         # 1) normalize to grayscale [0,1] and optionally crop
         q, q_pil = self._prepare_query(img_np)
 
-        # 2) build rotated views as PIL grayscale
+        # 2) build augmented query views as PIL grayscale
         angles = tuple(float(a) for a in self.cfg.angles)
-        pils = [q_pil.rotate(a, resample=Image.BILINEAR, expand=False) for a in angles]
+        aug_views = self._build_query_variants(q_pil, angles)
 
-        # 3) embed all rotations in a single batch -> (A,D)
+        if not aug_views:
+            raise ValueError("No query variants were generated. Check angles/flip settings.")
+
+        pils = [item["pil"] for item in aug_views]
+
+        # 3) embed all augmented views in a single batch -> (A,D)
         G = model.embed_pil_batch(pils).astype(np.float32, copy=False)  # (A, D)
         if G.ndim != 2:
             raise ValueError(f"Expected embeddings (A,D), got {G.shape}")
 
-        # 4) single FAISS call for all rotations at once
+        # 4) single FAISS call for all augmented views at once
         D_all, I_all = self.store.search(G, self.cfg.k_per_angle)  # each (A, k_per_angle)
 
-        # 5) first dedup: keep best score per patch_id across all query rotations
-        best_patch: Dict[int, Tuple[float, float]] = {}  # patch_id -> (score, best_query_angle)
+        # 5) first dedup: keep best score per patch_id across all query augmentations
+        # patch_id -> (score, best_query_angle, best_flip_x, best_flip_y, aug_idx)
+        best_patch: Dict[int, Tuple[float, float, bool, bool, int]] = {}
 
-        for a_idx, angle in enumerate(angles):
-            d_row = D_all[a_idx]
-            i_row = I_all[a_idx]
+        for aug_idx, aug in enumerate(aug_views):
+            angle = float(aug["angle"])
+            flip_x = bool(aug["flip_x"])
+            flip_y = bool(aug["flip_y"])
+
+            d_row = D_all[aug_idx]
+            i_row = I_all[aug_idx]
 
             for score, pid in zip(d_row, i_row):
                 pid = int(pid)
@@ -141,7 +160,7 @@ class SliceSearcher:
                 sc = float(score)
                 prev = best_patch.get(pid)
                 if prev is None or sc > prev[0]:
-                    best_patch[pid] = (sc, float(angle))
+                    best_patch[pid] = (sc, angle, flip_x, flip_y, aug_idx)
 
         if not best_patch:
             return [], q
@@ -150,8 +169,8 @@ class SliceSearcher:
         candidate_ids = list(best_patch.keys())
         df_rows = self.store.rows_for_ids(candidate_ids)
 
-        # slice_key -> (patch_id, score, angle)
-        best_slice: Dict[tuple[int, int, int], Tuple[int, float, float]] = {}
+        # slice_key -> (patch_id, score, angle, flip_x, flip_y, aug_idx)
+        best_slice: Dict[tuple[int, int, int], Tuple[int, float, float, bool, bool, int]] = {}
 
         for pid in candidate_ids:
             row = df_rows.loc[int(pid)]
@@ -161,18 +180,22 @@ class SliceSearcher:
                 continue
 
             slice_key = self._slice_key_from_row(row)
-            score, angle = best_patch[int(pid)]
+            score, angle, flip_x, flip_y, aug_idx = best_patch[int(pid)]
 
             prev = best_slice.get(slice_key)
             if prev is None or score > prev[1]:
-                best_slice[slice_key] = (int(pid), float(score), float(angle))
+                best_slice[slice_key] = (int(pid), float(score), float(angle), bool(flip_x), bool(flip_y), int(aug_idx))
 
         if not best_slice:
             return [], q
 
         if self.cfg.verbose:
             log("search", [
-                f"Candidates before patch dedup : {sum(len(I_all[a]) for a in range(len(angles)))}",
+                f"Angles                        : {len(angles)}",
+                f"flip_x                        : {bool(self.cfg.flip_x)}",
+                f"flip_y                        : {bool(self.cfg.flip_y)}",
+                f"Total query variants          : {len(aug_views)}",
+                f"Candidates before patch dedup : {sum(len(I_all[a]) for a in range(len(aug_views)))}",
                 f"Unique patch ids              : {len(best_patch)}",
                 f"Unique indexed slices         : {len(best_slice)}",
             ])
@@ -181,24 +204,26 @@ class SliceSearcher:
         sorted_hits = sorted(best_slice.values(), key=lambda t: t[1], reverse=True)
         top = sorted_hits[: int(k)]
 
-        ids = [pid for pid, _, _ in top]
+        ids = [pid for pid, _, _, _, _, _ in top]
         df_top = self.store.rows_for_ids(ids)
 
         results: List[SearchResult] = []
-        for pid, score, angle in top:
+        for pid, score, angle, flip_x, flip_y, _aug_idx in top:
             row = df_top.loc[int(pid)]
             results.append(
                 SearchResult(
                     patch_id=int(pid),
                     score=float(score),
                     angle=float(angle),
+                    flip_x=bool(flip_x),
+                    flip_y=bool(flip_y),
                     meta=row.to_dict(),
                 )
             )
 
         # 8) Optional reranking
         if self.cfg.use_reranker and self.reranker is not None and results:
-            self._apply_reranker(results, G, angles)
+            self._apply_reranker(results, G, aug_views)
 
         return results, q
 
@@ -209,10 +234,65 @@ class SliceSearcher:
             row["patch_id"] = h.patch_id
             row["score"] = h.score
             row["query_angle_deg"] = h.angle
+            row["query_flip_x"] = h.flip_x
+            row["query_flip_y"] = h.flip_y
             if h.rerank_score is not None:
                 row["rerank_score"] = h.rerank_score
             rows.append(row)
         return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # Query augmentation
+    # ------------------------------------------------------------------
+
+    def _build_query_variants(self, q_pil: Image.Image, angles: Tuple[float, ...]) -> List[Dict[str, Any]]:
+        """
+        Build all query augmentation variants.
+
+        For each rotation angle, optionally include:
+          - original
+          - flip_x
+          - flip_y
+          - flip_x + flip_y
+
+        Returns a list of dicts:
+            {
+                "pil": PIL.Image,
+                "angle": float,
+                "flip_x": bool,
+                "flip_y": bool,
+            }
+        """
+        variants: List[Dict[str, Any]] = []
+
+        flip_states_x = [False, True] if self.cfg.flip_x else [False]
+        flip_states_y = [False, True] if self.cfg.flip_y else [False]
+
+        for angle in angles:
+            base = q_pil.rotate(float(angle), resample=Image.BILINEAR, expand=False)
+
+            for flip_x in flip_states_x:
+                for flip_y in flip_states_y:
+                    img = base
+
+                    # PIL transpose names are from image coordinates:
+                    # FLIP_LEFT_RIGHT  = horizontal mirror
+                    # FLIP_TOP_BOTTOM  = vertical mirror
+                    if flip_x:
+                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    if flip_y:
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+                    variants.append(
+                        {
+                            "pil": img,
+                            "angle": float(angle),
+                            "flip_x": bool(flip_x),
+                            "flip_y": bool(flip_y),
+                        }
+                    )
+
+        return variants
 
     # ------------------------------------------------------------------
     # Reranker integration
@@ -246,14 +326,14 @@ class SliceSearcher:
 
         raise ValueError(f"Unknown normalize mode: {mode!r}")
 
-    def _apply_reranker(self, results: List[SearchResult], G: np.ndarray, angles: Tuple[float, ...]) -> None:
+    def _apply_reranker(self, results: List[SearchResult], G: np.ndarray, aug_views: List[Dict[str, Any]]) -> None:
         """
         Rerank only the top `rerank_topk` results, then keep the remainder in coarse order.
 
         Modes:
-          - best_angle: use query embedding of the best coarse hit's angle (single listwise call)
-          - max_over_angles: score listwise per angle, take max score per candidate
-          - per_hit_angle: score each hit using its own best angle (uses score_pairs; less "listwise-pure")
+          - best_angle: use query embedding of the best coarse hit's exact augmentation (single listwise call)
+          - max_over_angles: score listwise per augmented query, take max score per candidate
+          - per_hit_angle: score each hit using its own best coarse augmentation (uses score_pairs)
 
         Blending:
           final_score = (1 - alpha) * cosine + alpha * reranker
@@ -274,21 +354,38 @@ class SliceSearcher:
 
         # --- compute reranker scores (topk,) ---
         if mode == "best_angle":
-            q_angle = float(top_hits[0].angle)
-            a_idx = self._angle_to_idx(q_angle, angles)
-            q_emb = G[a_idx]
+            q_idx = self._variant_to_idx(
+                angle=float(top_hits[0].angle),
+                flip_x=bool(top_hits[0].flip_x),
+                flip_y=bool(top_hits[0].flip_y),
+                aug_views=aug_views,
+            )
+            q_emb = G[q_idx]
             scores = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
 
         elif mode == "max_over_angles":
             all_scores = []
-            for a_idx in range(len(angles)):
-                q_emb = G[a_idx]
+            for aug_idx in range(len(aug_views)):
+                q_emb = G[aug_idx]
                 s = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
                 all_scores.append(s)
             scores = np.max(np.stack(all_scores, axis=0), axis=0).astype(np.float32, copy=False)
 
         elif mode == "per_hit_angle":
-            q_embs = np.stack([G[self._angle_to_idx(float(h.angle), angles)] for h in top_hits], axis=0)  # (topk,D)
+            q_embs = np.stack(
+                [
+                    G[
+                        self._variant_to_idx(
+                            angle=float(h.angle),
+                            flip_x=bool(h.flip_x),
+                            flip_y=bool(h.flip_y),
+                            aug_views=aug_views,
+                        )
+                    ]
+                    for h in top_hits
+                ],
+                axis=0,
+            )  # (topk,D)
             scores = self.reranker.score_pairs(q_embs, cand_embs)  # (topk,)
 
         else:
@@ -327,9 +424,31 @@ class SliceSearcher:
         results[:] = top_hits_sorted + rest_hits
 
     @staticmethod
-    def _angle_to_idx(a_val: float, angles: Tuple[float, ...]) -> int:
-        # robust nearest match (float-safe)
-        return int(min(range(len(angles)), key=lambda i: abs(float(angles[i]) - float(a_val))))
+    def _variant_to_idx(
+        angle: float,
+        flip_x: bool,
+        flip_y: bool,
+        aug_views: List[Dict[str, Any]],
+    ) -> int:
+        """
+        Robust lookup for the query augmentation index that matches
+        (angle, flip_x, flip_y).
+        """
+        best_idx = 0
+        best_err = float("inf")
+
+        for i, v in enumerate(aug_views):
+            same_fx = bool(v["flip_x"]) == bool(flip_x)
+            same_fy = bool(v["flip_y"]) == bool(flip_y)
+            if not (same_fx and same_fy):
+                continue
+
+            err = abs(float(v["angle"]) - float(angle))
+            if err < best_err:
+                best_err = err
+                best_idx = i
+
+        return int(best_idx)
 
     # ------------------------------------------------------------------
     # Query preprocessing

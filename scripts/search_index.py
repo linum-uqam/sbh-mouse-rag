@@ -1,4 +1,3 @@
-# index/scripts/search_index.py
 from __future__ import annotations
 
 import argparse
@@ -12,6 +11,7 @@ from index.search import SliceSearcher, SearchConfig, SearchResult
 from index.utils import log, load_image_gray
 from index.config import OUT_DIR
 from index.vis import save_search_results_visuals, save_hits_only_images
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
         "--k",
         type=int,
         default=10,
-        help="Number of top results to return (after merging rotations).",
+        help="Number of top results to return (after merging rotations/flips).",
     )
     parser.add_argument(
         "--angles",
@@ -40,8 +40,21 @@ def parse_args() -> argparse.Namespace:
         "--k-per-angle",
         type=int,
         default=64,
-        help="Number of neighbours to fetch per rotation (default: 64).",
+        help="Number of neighbours to fetch per query variant (default: 64).",
     )
+
+    # Default = enabled
+    parser.add_argument(
+        "--no-flip-x",
+        action="store_true",
+        help="Disable horizontal flip augmentation on the query image.",
+    )
+    parser.add_argument(
+        "--no-flip-y",
+        action="store_true",
+        help="Disable vertical flip augmentation on the query image.",
+    )
+
     parser.add_argument(
         "--no-crop",
         action="store_true",
@@ -79,8 +92,13 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+
 def main() -> None:
     args = parse_args()
+
+    flip_x = not args.no_flip_x
+    flip_y = not args.no_flip_y
+    query_variant_count = len(args.angles) * (2 if flip_x else 1) * (2 if flip_y else 1)
 
     log("search", [
         "Starting search...",
@@ -88,6 +106,9 @@ def main() -> None:
         f"k             : {args.k}",
         f"Angles (deg)  : {args.angles}",
         f"k_per_angle   : {args.k_per_angle}",
+        f"flip_x        : {flip_x}",
+        f"flip_y        : {flip_y}",
+        f"Query variants: {query_variant_count}",
         f"Auto-crop     : {not args.no_crop}",
         f"Index root    : {args.index_root}",
         f"Save dir      : {args.save_dir}",
@@ -100,6 +121,8 @@ def main() -> None:
     # 2) Build search config
     cfg = SearchConfig(
         angles=tuple(float(a) for a in args.angles),
+        flip_x=flip_x,
+        flip_y=flip_y,
         k_per_angle=int(args.k_per_angle),
         crop_foreground=not args.no_crop,
         use_reranker=args.use_reranker,
@@ -133,9 +156,9 @@ def main() -> None:
         rotation_deg = m.get("rotation_deg", "?")
         extra = f" rerank={h.rerank_score:.4f}" if h.rerank_score is not None else ""
 
-        log("",[
+        log("", [
             f"[{i:02d}] score={h.score:.4f}{extra} ",
-            f"(query_angle={h.angle:.1f}°, patch_id={h.patch_id}) ",
+            f"(query_angle={h.angle:.1f}°, flip_x={h.flip_x}, flip_y={h.flip_y}, patch_id={h.patch_id}) ",
             f"normal={normal_idx} depth={depth_idx} scale={scale} ",
             f"box=({x0},{y0})-({x1},{y1}) depth_vox={depth_vox:.3f} rot_deg={rotation_deg:.1f}\n"
         ])
