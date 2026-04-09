@@ -16,6 +16,8 @@ from index.reranker.runtime import RerankerRuntimeConfig, RerankerService
 
 RerankQueryMode = Literal["best_angle", "max_over_angles", "per_hit_angle"]
 BlendNormMode = Literal["zscore", "minmax"]
+LocalSearchMode = Literal["off", "auto", "force"]
+LocalScoreMode = Literal["max", "top2_mean"]
 
 
 @dataclass
@@ -28,12 +30,32 @@ class SearchConfig:
     # Query augmentations
     flip_x: bool = False   # horizontal mirror (left-right)
     flip_y: bool = False   # vertical mirror (top-bottom)
+    pad_to_square: bool = True
 
     k_per_angle: int = 200
     crop_foreground: bool = True
     bg_threshold: float = 0.05
     min_fg_ratio: float = 0.05
     verbose: bool = True
+
+    # --- local crop search (v2 auto / v3 force) ---
+    local_search_mode: LocalSearchMode = "auto"   # off | auto | force
+    local_k_per_view: int | None = None            # defaults to k_per_angle
+    local_score_mode: LocalScoreMode = "top2_mean"
+    local_weight: float = 0.35
+    global_weight: float = 1.00
+
+    # v2 trigger
+    auto_local_aspect_threshold: float = 1.35
+
+    # sliding square windows for rectangular queries
+    local_crop_overlap: float = 0.50
+    local_crop_min_side_px: int = 64
+    auto_max_local_crops: int = 3
+    force_max_local_crops: int = 8
+
+    # extra square-query crops for v3 / force mode
+    force_square_scales: Tuple[int, ...] = (2,)
 
     # --- optional neural reranker (embedding-only) ---
     use_reranker: bool = False
@@ -70,6 +92,9 @@ class SearchResult:
     # optional metadata for augmented query provenance
     flip_x: bool = False
     flip_y: bool = False
+    query_variant_idx: int = -1
+    query_branch: str = "global"
+    query_crop_id: int = -1
 
 
 class SliceSearcher:
@@ -123,34 +148,36 @@ class SliceSearcher:
         # 1) normalize to grayscale [0,1] and optionally crop
         q, q_pil = self._prepare_query(img_np)
 
-        # 2) build augmented query views as PIL grayscale
+        # 2) build global + optional local query views
         angles = tuple(float(a) for a in self.cfg.angles)
-        aug_views = self._build_query_variants(q_pil, angles)
-
-        if not aug_views:
+        query_views = self._build_search_views(q, q_pil, angles)
+        if not query_views:
             raise ValueError("No query variants were generated. Check angles/flip settings.")
 
-        pils = [item["pil"] for item in aug_views]
-
-        # 3) embed all augmented views in a single batch -> (A,D)
+        # 3) embed all query views in a single batch -> (A,D)
+        pils = [item["pil"] for item in query_views]
         G = model.embed_pil_batch(pils).astype(np.float32, copy=False)  # (A, D)
         if G.ndim != 2:
             raise ValueError(f"Expected embeddings (A,D), got {G.shape}")
 
-        # 4) single FAISS call for all augmented views at once
-        D_all, I_all = self.store.search(G, self.cfg.k_per_angle)  # each (A, k_per_angle)
+        # 4) single FAISS call for all query views at once
+        per_view_k = [int(v.get("k", self.cfg.k_per_angle)) for v in query_views]
+        k_search = int(max(per_view_k)) if per_view_k else int(self.cfg.k_per_angle)
+        D_all, I_all = self.store.search(G, k_search)  # each (A, k_search)
 
-        # 5) first dedup: keep best score per patch_id across all query augmentations
-        # patch_id -> (score, best_query_angle, best_flip_x, best_flip_y, aug_idx)
-        best_patch: Dict[int, Tuple[float, float, bool, bool, int]] = {}
+        # 5) aggregate evidence per patch_id across global/local views
+        best_patch: Dict[int, Dict[str, Any]] = {}
 
-        for aug_idx, aug in enumerate(aug_views):
-            angle = float(aug["angle"])
-            flip_x = bool(aug["flip_x"])
-            flip_y = bool(aug["flip_y"])
+        for aug_idx, view in enumerate(query_views):
+            angle = float(view["angle"])
+            flip_x = bool(view["flip_x"])
+            flip_y = bool(view["flip_y"])
+            branch = str(view["branch"])
+            crop_id = int(view.get("crop_id", -1))
+            k_view = int(view.get("k", k_search))
 
-            d_row = D_all[aug_idx]
-            i_row = I_all[aug_idx]
+            d_row = D_all[aug_idx][:k_view]
+            i_row = I_all[aug_idx][:k_view]
 
             for score, pid in zip(d_row, i_row):
                 pid = int(pid)
@@ -158,57 +185,146 @@ class SliceSearcher:
                     continue
 
                 sc = float(score)
-                prev = best_patch.get(pid)
-                if prev is None or sc > prev[0]:
-                    best_patch[pid] = (sc, angle, flip_x, flip_y, aug_idx)
+                rec = best_patch.get(pid)
+                if rec is None:
+                    rec = {
+                        "global_best": None,
+                        "global_aug_idx": -1,
+                        "global_angle": 0.0,
+                        "global_flip_x": False,
+                        "global_flip_y": False,
+                        "global_crop_id": -1,
+                        "local_scores": [],
+                        "local_best": None,
+                        "local_aug_idx": -1,
+                        "local_angle": 0.0,
+                        "local_flip_x": False,
+                        "local_flip_y": False,
+                        "local_crop_id": -1,
+                    }
+                    best_patch[pid] = rec
+
+                if branch == "global":
+                    prev = rec["global_best"]
+                    if prev is None or sc > prev:
+                        rec["global_best"] = sc
+                        rec["global_aug_idx"] = aug_idx
+                        rec["global_angle"] = angle
+                        rec["global_flip_x"] = flip_x
+                        rec["global_flip_y"] = flip_y
+                        rec["global_crop_id"] = crop_id
+                else:
+                    rec["local_scores"].append(sc)
+                    prev = rec["local_best"]
+                    if prev is None or sc > prev:
+                        rec["local_best"] = sc
+                        rec["local_aug_idx"] = aug_idx
+                        rec["local_angle"] = angle
+                        rec["local_flip_x"] = flip_x
+                        rec["local_flip_y"] = flip_y
+                        rec["local_crop_id"] = crop_id
 
         if not best_patch:
             return [], q
 
-        # 6) second dedup: keep only one best patch per indexed source slice/image
-        candidate_ids = list(best_patch.keys())
+        # 6) collapse global/local evidence into a single coarse score per patch
+        fused_patch: Dict[int, Tuple[float, float, bool, bool, int, str, int]] = {}
+        # patch_id -> (score, angle, flip_x, flip_y, aug_idx, branch, crop_id)
+        for pid, rec in best_patch.items():
+            g = rec["global_best"]
+            l = self._aggregate_local_scores(rec["local_scores"])
+
+            fused = 0.0
+            if g is not None:
+                fused += float(self.cfg.global_weight) * float(g)
+            if l is not None:
+                fused += float(self.cfg.local_weight) * float(l)
+
+            if g is None and l is None:
+                continue
+
+            global_contrib = float(self.cfg.global_weight) * float(g) if g is not None else -np.inf
+            local_contrib = float(self.cfg.local_weight) * float(rec["local_best"]) if rec["local_best"] is not None else -np.inf
+
+            if global_contrib >= local_contrib:
+                fused_patch[pid] = (
+                    float(fused),
+                    float(rec["global_angle"]),
+                    bool(rec["global_flip_x"]),
+                    bool(rec["global_flip_y"]),
+                    int(rec["global_aug_idx"]),
+                    "global",
+                    int(rec["global_crop_id"]),
+                )
+            else:
+                fused_patch[pid] = (
+                    float(fused),
+                    float(rec["local_angle"]),
+                    bool(rec["local_flip_x"]),
+                    bool(rec["local_flip_y"]),
+                    int(rec["local_aug_idx"]),
+                    "local",
+                    int(rec["local_crop_id"]),
+                )
+
+        if not fused_patch:
+            return [], q
+
+        # 7) dedup by indexed source slice/image
+        candidate_ids = list(fused_patch.keys())
         df_rows = self.store.rows_for_ids(candidate_ids)
 
-        # slice_key -> (patch_id, score, angle, flip_x, flip_y, aug_idx)
-        best_slice: Dict[tuple[int, int, int], Tuple[int, float, float, bool, bool, int]] = {}
+        best_slice: Dict[tuple[int, int, int], Tuple[int, float, float, bool, bool, int, str, int]] = {}
+        # slice_key -> (patch_id, score, angle, flip_x, flip_y, aug_idx, branch, crop_id)
 
         for pid in candidate_ids:
             row = df_rows.loc[int(pid)]
-
-            # Defensive guard for missing manifest rows
             if row.isnull().all():
                 continue
 
             slice_key = self._slice_key_from_row(row)
-            score, angle, flip_x, flip_y, aug_idx = best_patch[int(pid)]
+            score, angle, flip_x, flip_y, aug_idx, branch, crop_id = fused_patch[int(pid)]
 
             prev = best_slice.get(slice_key)
             if prev is None or score > prev[1]:
-                best_slice[slice_key] = (int(pid), float(score), float(angle), bool(flip_x), bool(flip_y), int(aug_idx))
+                best_slice[slice_key] = (
+                    int(pid),
+                    float(score),
+                    float(angle),
+                    bool(flip_x),
+                    bool(flip_y),
+                    int(aug_idx),
+                    str(branch),
+                    int(crop_id),
+                )
 
         if not best_slice:
             return [], q
 
         if self.cfg.verbose:
+            n_global = sum(1 for v in query_views if v["branch"] == "global")
+            n_local = sum(1 for v in query_views if v["branch"] == "local")
             log("search", [
                 f"Angles                        : {len(angles)}",
                 f"flip_x                        : {bool(self.cfg.flip_x)}",
                 f"flip_y                        : {bool(self.cfg.flip_y)}",
-                f"Total query variants          : {len(aug_views)}",
-                f"Candidates before patch dedup : {sum(len(I_all[a]) for a in range(len(aug_views)))}",
-                f"Unique patch ids              : {len(best_patch)}",
+                f"Global query variants         : {n_global}",
+                f"Local query variants          : {n_local}",
+                f"Total query variants          : {len(query_views)}",
+                f"Candidates before patch dedup : {sum(len(I_all[a][:int(query_views[a].get('k', k_search))]) for a in range(len(query_views)))}",
+                f"Unique patch ids              : {len(fused_patch)}",
                 f"Unique indexed slices         : {len(best_slice)}",
             ])
 
-        # 7) sort unique slices by score desc and keep top-k
+        # 8) sort unique slices by score desc and keep top-k
         sorted_hits = sorted(best_slice.values(), key=lambda t: t[1], reverse=True)
         top = sorted_hits[: int(k)]
 
-        ids = [pid for pid, _, _, _, _, _ in top]
+        ids = [pid for pid, *_rest in top]
         df_top = self.store.rows_for_ids(ids)
 
         results: List[SearchResult] = []
-        for pid, score, angle, flip_x, flip_y, _aug_idx in top:
+        for pid, score, angle, flip_x, flip_y, aug_idx, branch, crop_id in top:
             row = df_top.loc[int(pid)]
             results.append(
                 SearchResult(
@@ -217,13 +333,16 @@ class SliceSearcher:
                     angle=float(angle),
                     flip_x=bool(flip_x),
                     flip_y=bool(flip_y),
+                    query_variant_idx=int(aug_idx),
+                    query_branch=str(branch),
+                    query_crop_id=int(crop_id),
                     meta=row.to_dict(),
                 )
             )
 
-        # 8) Optional reranking
+        # 9) Optional reranking
         if self.cfg.use_reranker and self.reranker is not None and results:
-            self._apply_reranker(results, G, aug_views)
+            self._apply_reranker(results, G)
 
         return results, q
 
@@ -236,16 +355,64 @@ class SliceSearcher:
             row["query_angle_deg"] = h.angle
             row["query_flip_x"] = h.flip_x
             row["query_flip_y"] = h.flip_y
+            row["query_branch"] = h.query_branch
+            row["query_crop_id"] = h.query_crop_id
             if h.rerank_score is not None:
                 row["rerank_score"] = h.rerank_score
             rows.append(row)
         return pd.DataFrame(rows)
 
     # ------------------------------------------------------------------
-    # Query augmentation
+    # Query view building
     # ------------------------------------------------------------------
 
-    def _build_query_variants(self, q_pil: Image.Image, angles: Tuple[float, ...]) -> List[Dict[str, Any]]:
+    def _build_search_views(self, q: np.ndarray, q_pil: Image.Image, angles: Tuple[float, ...]) -> List[Dict[str, Any]]:
+        views: List[Dict[str, Any]] = []
+
+        global_pil = self._pad_pil_to_square(q_pil) if self.cfg.pad_to_square else q_pil
+        views.extend(self._build_query_variants(global_pil, angles, branch="global", crop_id=-1, k=self.cfg.k_per_angle))
+
+        local_enabled, reason = self._should_enable_local_search(q)
+        local_crops = self._build_local_crops(q, force=(self.cfg.local_search_mode == "force")) if local_enabled else []
+        local_k = int(self.cfg.local_k_per_view or self.cfg.k_per_angle)
+
+        for crop in local_crops:
+            crop_img = crop["image"]
+            crop_pil = Image.fromarray((np.clip(crop_img, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L")
+            crop_pil = self._pad_pil_to_square(crop_pil) if self.cfg.pad_to_square else crop_pil
+            views.extend(
+                self._build_query_variants(
+                    crop_pil,
+                    angles,
+                    branch="local",
+                    crop_id=int(crop["crop_id"]),
+                    k=local_k,
+                )
+            )
+
+        if self.cfg.verbose:
+            h, w = q.shape
+            ratio = max(float(w) / max(float(h), 1.0), float(h) / max(float(w), 1.0))
+            log("search", [
+                f"Prepared query size           : {h}x{w}",
+                f"Aspect ratio                  : {ratio:.3f}",
+                f"Local search mode             : {self.cfg.local_search_mode}",
+                f"Local search active           : {local_enabled}",
+                f"Local search reason           : {reason}",
+                f"Local crop count              : {len(local_crops)}",
+            ])
+
+        return views
+
+    def _build_query_variants(
+        self,
+        q_pil: Image.Image,
+        angles: Tuple[float, ...],
+        *,
+        branch: str,
+        crop_id: int,
+        k: int,
+    ) -> List[Dict[str, Any]]:
         """
         Build all query augmentation variants.
 
@@ -254,14 +421,6 @@ class SliceSearcher:
           - flip_x
           - flip_y
           - flip_x + flip_y
-
-        Returns a list of dicts:
-            {
-                "pil": PIL.Image,
-                "angle": float,
-                "flip_x": bool,
-                "flip_y": bool,
-            }
         """
         variants: List[Dict[str, Any]] = []
 
@@ -274,10 +433,6 @@ class SliceSearcher:
             for flip_x in flip_states_x:
                 for flip_y in flip_states_y:
                     img = base
-
-                    # PIL transpose names are from image coordinates:
-                    # FLIP_LEFT_RIGHT  = horizontal mirror
-                    # FLIP_TOP_BOTTOM  = vertical mirror
                     if flip_x:
                         img = img.transpose(Image.FLIP_LEFT_RIGHT)
                     if flip_y:
@@ -289,10 +444,147 @@ class SliceSearcher:
                             "angle": float(angle),
                             "flip_x": bool(flip_x),
                             "flip_y": bool(flip_y),
+                            "branch": str(branch),
+                            "crop_id": int(crop_id),
+                            "k": int(k),
                         }
                     )
 
         return variants
+
+    def _should_enable_local_search(self, q: np.ndarray) -> Tuple[bool, str]:
+        mode = str(self.cfg.local_search_mode)
+        if mode == "off":
+            return False, "disabled"
+        if mode == "force":
+            return True, "forced"
+
+        h, w = q.shape
+        short_side = min(h, w)
+        if short_side < int(self.cfg.local_crop_min_side_px):
+            return False, f"short_side<{int(self.cfg.local_crop_min_side_px)}"
+
+        ratio = max(float(w) / max(float(h), 1.0), float(h) / max(float(w), 1.0))
+        if ratio >= float(self.cfg.auto_local_aspect_threshold):
+            return True, f"aspect_ratio>={float(self.cfg.auto_local_aspect_threshold):.2f}"
+
+        return False, "ratio_not_triggered"
+
+    def _build_local_crops(self, q: np.ndarray, *, force: bool) -> List[Dict[str, Any]]:
+        h, w = q.shape
+        crops: List[Dict[str, Any]] = []
+        crop_id = 0
+        seen_boxes: set[Tuple[int, int, int, int]] = set()
+
+        def add_crop(y0: int, y1: int, x0: int, x1: int) -> None:
+            nonlocal crop_id
+            box = (int(y0), int(y1), int(x0), int(x1))
+            if box in seen_boxes:
+                return
+            seen_boxes.add(box)
+            crop = q[y0:y1, x0:x1]
+            if crop.size == 0:
+                return
+            ch, cw = crop.shape
+            if min(ch, cw) < int(self.cfg.local_crop_min_side_px):
+                return
+            crops.append({
+                "crop_id": crop_id,
+                "box": box,
+                "image": crop,
+            })
+            crop_id += 1
+
+        # Rectangular queries: slide square windows along the long axis.
+        if h != w:
+            side = min(h, w)
+            if h > w:
+                starts = self._sliding_starts(h, side, float(self.cfg.local_crop_overlap))
+                starts = self._reduce_positions(starts, max_count=self._max_local_crops(force))
+                for y0 in starts:
+                    add_crop(y0, y0 + side, 0, side)
+            else:
+                starts = self._sliding_starts(w, side, float(self.cfg.local_crop_overlap))
+                starts = self._reduce_positions(starts, max_count=self._max_local_crops(force))
+                for x0 in starts:
+                    add_crop(0, side, x0, x0 + side)
+
+        # Forced mode: also create square-grid local crops on square or rectangular queries.
+        if force:
+            side = min(h, w)
+            q_square = q[:side, :side]
+            qh, qw = q_square.shape
+            for scale in self.cfg.force_square_scales:
+                scale = int(scale)
+                if scale <= 1:
+                    continue
+                win = max(1, int(round(side / float(scale))))
+                ys = self._sliding_starts(qh, win, float(self.cfg.local_crop_overlap))
+                xs = self._sliding_starts(qw, win, float(self.cfg.local_crop_overlap))
+                for y0 in ys:
+                    for x0 in xs:
+                        add_crop(y0, y0 + win, x0, x0 + win)
+                        if len(crops) >= self._max_local_crops(force):
+                            break
+                    if len(crops) >= self._max_local_crops(force):
+                        break
+                if len(crops) >= self._max_local_crops(force):
+                    break
+
+        return crops[: self._max_local_crops(force)]
+
+    def _max_local_crops(self, force: bool) -> int:
+        return int(self.cfg.force_max_local_crops if force else self.cfg.auto_max_local_crops)
+
+    @staticmethod
+    def _sliding_starts(length: int, window: int, overlap: float) -> List[int]:
+        if window >= length:
+            return [0]
+        overlap = float(np.clip(overlap, 0.0, 0.95))
+        step = max(1, int(round(window * (1.0 - overlap))))
+        starts = list(range(0, max(length - window, 0) + 1, step))
+        last = length - window
+        if not starts or starts[-1] != last:
+            starts.append(last)
+        return sorted(set(int(s) for s in starts))
+
+    @staticmethod
+    def _reduce_positions(starts: List[int], max_count: int) -> List[int]:
+        starts = sorted(set(int(s) for s in starts))
+        if len(starts) <= max_count:
+            return starts
+        if max_count <= 1:
+            return [starts[len(starts) // 2]]
+
+        idxs = np.linspace(0, len(starts) - 1, num=max_count)
+        picked = sorted(set(starts[int(round(i))] for i in idxs))
+        return picked
+
+    @staticmethod
+    def _pad_pil_to_square(pil: Image.Image) -> Image.Image:
+        w, h = pil.size
+        if w == h:
+            return pil
+        side = max(w, h)
+        out = Image.new(pil.mode, (side, side), color=0)
+        x = (side - w) // 2
+        y = (side - h) // 2
+        out.paste(pil, (x, y))
+        return out
+
+    def _aggregate_local_scores(self, scores: List[float]) -> float | None:
+        if not scores:
+            return None
+        vals = np.sort(np.asarray(scores, dtype=np.float32))[::-1]
+        if vals.size == 0:
+            return None
+
+        mode = str(self.cfg.local_score_mode)
+        if mode == "max" or vals.size == 1:
+            return float(vals[0])
+        if mode == "top2_mean":
+            return float(vals[: min(2, vals.size)].mean())
+        raise ValueError(f"Unknown local_score_mode={mode!r}")
 
     # ------------------------------------------------------------------
     # Reranker integration
@@ -326,7 +618,7 @@ class SliceSearcher:
 
         raise ValueError(f"Unknown normalize mode: {mode!r}")
 
-    def _apply_reranker(self, results: List[SearchResult], G: np.ndarray, aug_views: List[Dict[str, Any]]) -> None:
+    def _apply_reranker(self, results: List[SearchResult], G: np.ndarray) -> None:
         """
         Rerank only the top `rerank_topk` results, then keep the remainder in coarse order.
 
@@ -352,40 +644,21 @@ class SliceSearcher:
 
         mode = self.cfg.rerank_query_mode
 
-        # --- compute reranker scores (topk,) ---
         if mode == "best_angle":
-            q_idx = self._variant_to_idx(
-                angle=float(top_hits[0].angle),
-                flip_x=bool(top_hits[0].flip_x),
-                flip_y=bool(top_hits[0].flip_y),
-                aug_views=aug_views,
-            )
+            q_idx = int(top_hits[0].query_variant_idx)
             q_emb = G[q_idx]
             scores = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
 
         elif mode == "max_over_angles":
             all_scores = []
-            for aug_idx in range(len(aug_views)):
+            for aug_idx in range(G.shape[0]):
                 q_emb = G[aug_idx]
                 s = self.reranker.score_list(q_emb, cand_embs)  # (topk,)
                 all_scores.append(s)
             scores = np.max(np.stack(all_scores, axis=0), axis=0).astype(np.float32, copy=False)
 
         elif mode == "per_hit_angle":
-            q_embs = np.stack(
-                [
-                    G[
-                        self._variant_to_idx(
-                            angle=float(h.angle),
-                            flip_x=bool(h.flip_x),
-                            flip_y=bool(h.flip_y),
-                            aug_views=aug_views,
-                        )
-                    ]
-                    for h in top_hits
-                ],
-                axis=0,
-            )  # (topk,D)
+            q_embs = np.stack([G[int(h.query_variant_idx)] for h in top_hits], axis=0)  # (topk,D)
             scores = self.reranker.score_pairs(q_embs, cand_embs)  # (topk,)
 
         else:
@@ -393,7 +666,6 @@ class SliceSearcher:
 
         scores = np.asarray(scores, dtype=np.float32)
 
-        # --- blend reranker + cosine (over the reranked topk) ---
         alpha = float(self.cfg.rerank_alpha)
         alpha = float(np.clip(alpha, 0.0, 1.0))
 
@@ -409,12 +681,10 @@ class SliceSearcher:
 
         blended = (1.0 - alpha) * coarse_n + alpha * rerank_n
 
-        # store raw rerank score for logging/CSV, but use blended for ranking by overwriting h.score
         for h, s_raw, s_blend in zip(top_hits, scores, blended):
             h.rerank_score = float(s_raw)
             h.score = float(s_blend)
 
-        # Sort top_hits by blended score desc; tie-breaker: raw reranker
         top_hits_sorted = sorted(
             top_hits,
             key=lambda h: (h.score, h.rerank_score if h.rerank_score is not None else -1e9),
@@ -423,33 +693,6 @@ class SliceSearcher:
 
         results[:] = top_hits_sorted + rest_hits
 
-    @staticmethod
-    def _variant_to_idx(
-        angle: float,
-        flip_x: bool,
-        flip_y: bool,
-        aug_views: List[Dict[str, Any]],
-    ) -> int:
-        """
-        Robust lookup for the query augmentation index that matches
-        (angle, flip_x, flip_y).
-        """
-        best_idx = 0
-        best_err = float("inf")
-
-        for i, v in enumerate(aug_views):
-            same_fx = bool(v["flip_x"]) == bool(flip_x)
-            same_fy = bool(v["flip_y"]) == bool(flip_y)
-            if not (same_fx and same_fy):
-                continue
-
-            err = abs(float(v["angle"]) - float(angle))
-            if err < best_err:
-                best_err = err
-                best_idx = i
-
-        return int(best_idx)
-
     # ------------------------------------------------------------------
     # Query preprocessing
     # ------------------------------------------------------------------
@@ -457,7 +700,6 @@ class SliceSearcher:
     def _prepare_query(self, img_np: np.ndarray) -> Tuple[np.ndarray, Image.Image]:
         x = np.asarray(img_np)
 
-        # Handle channels if present
         if x.ndim == 3 and x.shape[2] in (1, 3):
             if x.shape[2] == 3:
                 x = x.mean(axis=2)
