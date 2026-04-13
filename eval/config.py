@@ -1,9 +1,12 @@
-# eval/config.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
+
+
+LocalSearchMode = Literal["off", "auto", "force"]
+LocalScoreMode = Literal["max", "top2_mean"]
 
 
 @dataclass
@@ -29,6 +32,27 @@ class EvalConfig:
     k_per_angle: int = 64
     crop_foreground: bool = True
     debug: bool = False
+
+    flip_x: bool = True
+    flip_y: bool = True
+    pad_to_square: bool = True
+
+    # High-level evaluation label, useful when running multiple modes
+    search_mode_label: str = "fast"
+
+    # New query expansion controls
+    local_search_mode: LocalSearchMode = "off"
+    local_k_per_view: Optional[int] = None
+    local_score_mode: LocalScoreMode = "top2_mean"
+    local_weight: float = 0.35
+    global_weight: float = 1.0
+
+    auto_local_aspect_threshold: float = 1.35
+    local_crop_overlap: float = 0.50
+    local_crop_min_side_px: int = 64
+    auto_max_local_crops: int = 3
+    force_max_local_crops: int = 8
+    force_square_scales: Tuple[int, ...] = (2,)
 
     # -------- Geometry distance (delegated to volume_helper.Slice.distance) --------
     distance_grid: int = 64

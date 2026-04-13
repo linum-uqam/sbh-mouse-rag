@@ -1,22 +1,20 @@
-# scripts/create_reranker_dataset.py
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-# Use the public API re-exported in dataset/__init__.py
 from dataset import DatasetConfig, MouseBrainDatasetBuilder
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Create Allen/real dataset (full slices + random crops) "
+            "Create Allen/real dataset (full slices + crops) "
             "for reranker training/validation."
         )
     )
 
-    # Output (different defaults from eval dataset)
+    # Output
     p.add_argument(
         "--out-dir",
         type=Path,
@@ -56,8 +54,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1000,
         help=(
-            "Total number of dataset rows (full + crops). "
-            "Use a larger value (e.g. 5000–20000) for reranker training."
+            "Number of base planes to sample. "
+            "Final row count is larger because each plane generates one full slice "
+            "plus multiple crops."
         ),
     )
     p.add_argument(
@@ -72,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--max-crop-attempts",
         type=int,
         default=50,
-        help="Max random crop attempts per valid full slice.",
+        help="Max random crop attempts per requested crop.",
     )
     p.add_argument(
         "--min-crop-frac",
@@ -87,6 +86,30 @@ def parse_args() -> argparse.Namespace:
         help="Max crop size as fraction of slice (0–1).",
     )
 
+    p.add_argument(
+        "--crop-aspects",
+        type=str,
+        nargs="+",
+        default=["square", "wide", "tall"],
+        choices=["square", "wide", "tall"],
+        help=(
+            "Crop aspect families to generate. "
+            "Default: square wide tall"
+        ),
+    )
+    p.add_argument(
+        "--wide-ratio",
+        type=float,
+        default=2.0,
+        help="Width/height ratio used for 'wide' crops (default: 2.0).",
+    )
+    p.add_argument(
+        "--tall-ratio",
+        type=float,
+        default=2.0,
+        help="Height/width ratio used for 'tall' crops (default: 2.0).",
+    )
+
     # Misc
     p.add_argument(
         "--no-save-images",
@@ -96,8 +119,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seed",
         type=int,
-        default=123,  # different default from eval to reduce overlap
-        help="Random seed (use a different seed than the eval dataset).",
+        default=123,
+        help="Random seed.",
     )
 
     return p.parse_args()
@@ -105,6 +128,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    crop_aspect_ratios: tuple[tuple[float, float], ...] = tuple(
+        {
+            "square": (1.0, 1.0),
+            "wide": (float(args.wide_ratio), 1.0),
+            "tall": (1.0, float(args.tall_ratio)),
+        }[name]
+        for name in args.crop_aspects
+    )
 
     cfg = DatasetConfig(
         out_dir=args.out_dir,
@@ -117,11 +149,14 @@ def main() -> None:
         max_crop_attempts=args.max_crop_attempts,
         min_crop_frac=args.min_crop_frac,
         max_crop_frac=args.max_crop_frac,
+        crop_aspect_ratios=crop_aspect_ratios,
         save_images=not args.no_save_images,
         seed=args.seed,
     )
+
     builder = MouseBrainDatasetBuilder(cfg)
     builder.run()
+
 
 if __name__ == "__main__":
     main()

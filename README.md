@@ -1,21 +1,13 @@
 # SBH-MOUSE-RAG
 
+# Quick start
+
 ## Setup environnement
 
 ```bash
 python3.11 -m venv .venv; source .venv/bin/activate;
 pip install uv
 uv sync 
-```
-
-## Volume
-```bash
-python -m scripts.volume_usage
-```
-
-## Dataset
-```bash
-python -m scripts.create_dataset
 ```
 
 ## Index
@@ -34,9 +26,36 @@ python -m scripts.create_index --save-patch-images --patch-image-dirname patch_p
 # Base search (only faiss cosine similarity)
 python -m scripts.search_index \
   out/dataset/data/00005_a_crop1.png \
+  --local-search-mode auto \
   --k 20 \
+  --angles 0 45 90 135 180 225 270 315 \
   --k-per-angle 64 \
   --save-dir out/search/baseline
+
+# With re-ranker (using MLP on embeddings as reranker)
+python -m scripts.search_index \
+  out/dataset/data/00005_a_crop1.png \
+  --local-search-mode force \
+  --force-max-local-crops 8 \
+  --force-square-scales 2 \
+  --k 20 \
+  --angles 0 45 90 135 180 225 270 315 \
+  --k-per-angle 64 \
+  --save-dir out/search/reranked \
+  --use-reranker \
+  --reranker-model out/reranker/reranker_listwise.pt \
+  --rerank-topk 100
+```
+
+
+## Volume
+```bash
+python -m scripts.volume_usage
+```
+
+## Dataset
+```bash
+python -m scripts.create_dataset
 ```
 
 ## Eval
@@ -56,8 +75,20 @@ python -m scripts.run_eval \
 
 **Run the report script**
 ```bash
-python -m scripts.run_report --csv out/eval/base/eval_hits.csv
+# compare search modes 
+python eval/report.py \
+  --csv out/eval/eval_modes/fast --label fast \
+  --csv out/eval/eval_modes/smart --label smart \
+  --csv out/eval/eval_modes/enhanced --label enhanced \
+  --baseline fast \
+  --save out/eval_compare/compare_modes.csv
+
+# Reranker vs base search
+python -m scripts.run_report \
+  --baseline out/eval/eval_modes/fast \
+  --rerank out/eval/eval_modes_rerank/fast
 ```
+
 
 ## Re-ranker
 
@@ -75,11 +106,13 @@ python -m scripts.create_reranker_dataset \
 # Run the eval to create the base hits that will be use to train the reranker.
 python -m scripts.run_eval \
   --csv out/reranker_dataset/dataset.csv \
+  --search-mode fast \
   --source both \
   --final-k 100 \
-  --k-per-angle 64 \
+  --angles 0 45 90 135 180 225 270 315 \
+  --k-per-angle 128 \
   --save-dir out/reranker_dataset \
-  --distance-grid 32 \
+  --distance-grid 12 \
   --distance-trim 0.05
 ```
 
@@ -100,7 +133,8 @@ python -m scripts.train_reranker \
 # With re-ranker (using MLP on embeddings as reranker)
 python -m scripts.search_index \
   out/dataset/data/00005_a_crop1.png \
-  --k 10 \
+  --k 20 \
+  --angles 0 45 90 135 180 225 270 315 \
   --k-per-angle 64 \
   --save-dir out/search/reranked \
   --use-reranker \
@@ -112,6 +146,7 @@ python -m scripts.search_index \
 ```bash
 # With reranker
 python -m scripts.run_eval \
+  --search-mode all
   --csv out/dataset/dataset.csv \
   --source both \
   --final-k 100 \
@@ -132,7 +167,6 @@ python -m scripts.run_eval \
 python -m scripts.run_report \
   --baseline out/eval/base/eval_hits.csv \
   --rerank out/eval/rerank/eval_hits.csv
-
 ```
 
 ## Paper 

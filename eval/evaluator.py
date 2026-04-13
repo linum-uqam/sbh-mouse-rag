@@ -1,4 +1,3 @@
-# eval/evaluator.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +6,6 @@ from typing import Optional, List, Tuple, Dict, Any, Set
 import csv
 import gc
 import hashlib
-import itertools as it
 import json
 import random
 import time
@@ -29,13 +27,6 @@ from eval.stats import Stats
 
 
 class _CSVStreamWriter:
-    """
-    Streaming CSV writer with:
-      - append mode
-      - lazy header initialization
-      - optional header migration if new columns appear
-      - periodic flush
-    """
     def __init__(self, path: Path, append: bool, flush_every: int = 128) -> None:
         self.path = path
         self.append = bool(append)
@@ -128,28 +119,14 @@ class _CSVStreamWriter:
 
 @dataclass(frozen=True)
 class _HitRecord:
-    """Geometry-only per-hit record."""
     geom_dist_vox: float
     corner_chamfer_3pt_um: float
 
 
 class Evaluator:
-    """
-    Dataset-driven eval loop:
-      - run retrieval (optionally reranker)
-      - for each hit: compute geometry distance using Slice.distance(..., physical=False)
-      - build listwise soft targets over the top-K hits using adaptive tau(query)
-      - write one CSV row per hit
-
-    Notes:
-      - No symmetry-aware min-over-mirror (strict laterality).
-      - No region metrics, no aligned quality, no custom Chamfer implementation.
-    """
-
     def __init__(self, cfg: EvalConfig) -> None:
         self.cfg = cfg
 
-        # --- dependencies ---
         self.store = IndexStore().load_all()
 
         self.search_cfg = SearchConfig(
@@ -157,6 +134,20 @@ class Evaluator:
             k_per_angle=self.cfg.k_per_angle,
             crop_foreground=self.cfg.crop_foreground,
             verbose=self.cfg.debug,
+            flip_x=self.cfg.flip_x,
+            flip_y=self.cfg.flip_y,
+            pad_to_square=self.cfg.pad_to_square,
+            local_search_mode=self.cfg.local_search_mode,
+            local_k_per_view=self.cfg.local_k_per_view,
+            local_score_mode=self.cfg.local_score_mode,
+            local_weight=self.cfg.local_weight,
+            global_weight=self.cfg.global_weight,
+            auto_local_aspect_threshold=self.cfg.auto_local_aspect_threshold,
+            local_crop_overlap=self.cfg.local_crop_overlap,
+            local_crop_min_side_px=self.cfg.local_crop_min_side_px,
+            auto_max_local_crops=self.cfg.auto_max_local_crops,
+            force_max_local_crops=self.cfg.force_max_local_crops,
+            force_square_scales=self.cfg.force_square_scales,
             use_reranker=self.cfg.use_reranker,
             rerank_topk=self.cfg.rerank_topk,
             reranker_model_path=self.cfg.reranker_model_path,
@@ -181,24 +172,22 @@ class Evaluator:
             resolution_um=self.cfg.allen_res_um,
         )
 
-        # bounded LRU cache: key=(normal_idx, depth_idx, rot_idx) -> Slice
         self._retrieved_slice_cache: OrderedDict[Tuple[int, int, int], Slice] = OrderedDict()
+        self._retrieved_patch_cache: OrderedDict[int, Slice] = OrderedDict()
+        self._max_patch_cache = max(1, int(self.cfg.max_retrieved_slice_cache) * 4)
 
-        # Output
         self.save_dir: Path = Path(self.cfg.save_dir or "out/eval")
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.results_csv_path: Path = self.save_dir / "eval_hits.csv"
 
         self.eval_sig = self._make_eval_signature()
 
-        # Safety: enforce voxel-space distance to avoid spacing mismatches
         if bool(self.cfg.distance_physical):
             raise ValueError(
                 "EvalConfig.distance_physical must be False. "
                 "Use voxel-space distances to avoid Allen/Real spacing mismatches."
             )
 
-        # Resume / overwrite planning
         if self.cfg.overwrite and self.results_csv_path.exists():
             self.results_csv_path.unlink()
 
@@ -212,15 +201,12 @@ class Evaluator:
 
         self._rows_to_process = self._compute_rows_to_process()
         self._rows_to_save = self._choose_rows_to_save(self._rows_to_process)
+
+        self._completed_query_sources: Dict[int, Set[str]] = self._scan_existing_completion_for_current_sig()
         self._pending_row_indices = self._build_pending_row_indices()
 
-        # Stats
         self.stats = Stats()
         self.stats.rows_total = len(self._pending_row_indices)
-
-    # -----------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------
 
     def run(self) -> None:
         if not self._pending_row_indices:
@@ -248,10 +234,6 @@ class Evaluator:
         finally:
             self._csv.close()
 
-    # -----------------------------------------------------------------
-    # Resume helpers
-    # -----------------------------------------------------------------
-
     def _make_eval_signature(self) -> str:
         payload = {
             "csv_path": str(self.cfg.csv_path),
@@ -264,6 +246,20 @@ class Evaluator:
             "final_k": self.cfg.final_k,
             "k_per_angle": self.cfg.k_per_angle,
             "crop_foreground": self.cfg.crop_foreground,
+            "flip_x": self.cfg.flip_x,
+            "flip_y": self.cfg.flip_y,
+            "pad_to_square": self.cfg.pad_to_square,
+            "local_search_mode": self.cfg.local_search_mode,
+            "local_k_per_view": self.cfg.local_k_per_view,
+            "local_score_mode": self.cfg.local_score_mode,
+            "local_weight": self.cfg.local_weight,
+            "global_weight": self.cfg.global_weight,
+            "auto_local_aspect_threshold": self.cfg.auto_local_aspect_threshold,
+            "local_crop_overlap": self.cfg.local_crop_overlap,
+            "local_crop_min_side_px": self.cfg.local_crop_min_side_px,
+            "auto_max_local_crops": self.cfg.auto_max_local_crops,
+            "force_max_local_crops": self.cfg.force_max_local_crops,
+            "force_square_scales": list(self.cfg.force_square_scales),
             "distance_grid": self.cfg.distance_grid,
             "distance_trim_frac": self.cfg.distance_trim_frac,
             "tau_q_lo": self.cfg.tau_q_lo,
@@ -281,10 +277,6 @@ class Evaluator:
         return hashlib.sha1(raw).hexdigest()[:12]
 
     def _prepare_existing_results_file(self) -> None:
-        """
-        Remove partial groups for the current signature so resume won't duplicate
-        half-written queries.
-        """
         if not self.results_csv_path.exists() or self.results_csv_path.stat().st_size == 0:
             return
 
@@ -293,7 +285,6 @@ class Evaluator:
             rows = list(reader)
             header = reader.fieldnames or []
 
-        # Group counts for current signature only
         counts: Dict[Tuple[str, str], int] = defaultdict(int)
         for row in rows:
             sig = row.get("eval_sig", "")
@@ -334,18 +325,12 @@ class Evaluator:
         )
 
     def _scan_existing_completion_for_current_sig(self) -> Dict[int, Set[str]]:
-        """
-        Return:
-            completed[row_idx] = {"allen", "real", ...}
-        for the current eval signature only.
-        """
         completed: Dict[int, Set[str]] = defaultdict(set)
 
         if not self.results_csv_path.exists() or self.results_csv_path.stat().st_size == 0:
             return completed
 
         counts: Dict[Tuple[int, str], int] = defaultdict(int)
-
         with self.results_csv_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -373,22 +358,20 @@ class Evaluator:
         return {"allen", "real"}
 
     def _count_completed_queries_for_current_sig(self) -> int:
-        completed = self._scan_existing_completion_for_current_sig()
         expected = self._expected_sources_per_row()
         n = 0
-        for _, done_sources in completed.items():
+        for _, done_sources in self._completed_query_sources.items():
             if expected.issubset(done_sources):
                 n += 1
         return n
 
     def _build_pending_row_indices(self) -> List[int]:
         total = self._rows_to_process
-        completed = self._scan_existing_completion_for_current_sig()
         expected = self._expected_sources_per_row()
 
         pending: List[int] = []
         for idx in range(total):
-            done_sources = completed.get(idx, set())
+            done_sources = self._completed_query_sources.get(idx, set())
             if expected.issubset(done_sources):
                 continue
             pending.append(idx)
@@ -400,10 +383,6 @@ class Evaluator:
             f"remaining: {len(pending)}"
         )
         return pending
-
-    # -----------------------------------------------------------------
-    # Row processing
-    # -----------------------------------------------------------------
 
     def _process_dataset_row(self, *, idx: int, sample: Dict[str, Any], pbar: tqdm) -> None:
         t0 = time.perf_counter()
@@ -417,7 +396,6 @@ class Evaluator:
         row_top1_corner: List[float] = []
 
         for src_name, q_slice in sources:
-            # skip source already completed for current signature
             if self._is_query_source_already_complete(idx=idx, src_name=src_name):
                 continue
 
@@ -442,6 +420,9 @@ class Evaluator:
                 gt_logits=gt_logits,
                 gt_probs=gt_probs,
             )
+
+            if len(hits) >= int(self.cfg.final_k):
+                self._mark_query_source_complete(idx=idx, src_name=src_name)
 
             if self.cfg.save_k and idx in self._rows_to_save:
                 qdir = self.save_dir / f"{idx:05d}_{src_name}"
@@ -488,23 +469,10 @@ class Evaluator:
         self._maybe_collect_memory(idx)
 
     def _is_query_source_already_complete(self, *, idx: int, src_name: str) -> bool:
-        if not self.results_csv_path.exists() or self.results_csv_path.stat().st_size == 0:
-            return False
+        return str(src_name) in self._completed_query_sources.get(int(idx), set())
 
-        count = 0
-        with self.results_csv_path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("eval_sig", "") != self.eval_sig:
-                    continue
-                try:
-                    if int(row["row_idx"]) == idx and str(row["source"]) == src_name:
-                        count += 1
-                        if count >= int(self.cfg.final_k):
-                            return True
-                except Exception:
-                    continue
-        return False
+    def _mark_query_source_complete(self, *, idx: int, src_name: str) -> None:
+        self._completed_query_sources.setdefault(int(idx), set()).add(str(src_name))
 
     def _maybe_collect_memory(self, idx: int) -> None:
         if self.cfg.gc_every_rows <= 0:
@@ -521,10 +489,6 @@ class Evaluator:
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-
-    # -----------------------------------------------------------------
-    # Source/query evaluation
-    # -----------------------------------------------------------------
 
     def _evaluate_one_source(
         self,
@@ -545,29 +509,17 @@ class Evaluator:
 
         hit_records: List[_HitRecord] = []
         for h in hits:
-            d_vox = self._geom_distance_for_hit(q_slice=q_slice, hit=h)
-            r_plane = self._get_retrieved_plane_slice(h)
-            if r_plane is None:
-                hit_records.append(_HitRecord(geom_dist_vox=float(d_vox), corner_chamfer_3pt_um=float("nan")))
-                continue
-
-            r_patch = self._crop_plane_to_patch(r_plane, h)
+            r_patch = self._get_retrieved_patch_slice(h)
             if r_patch is None:
-                hit_records.append(_HitRecord(geom_dist_vox=float(d_vox), corner_chamfer_3pt_um=float("nan")))
+                hit_records.append(_HitRecord(geom_dist_vox=float("nan"), corner_chamfer_3pt_um=float("nan")))
                 continue
 
+            d_vox = self._geom_distance_for_patch(q_slice=q_slice, r_patch=r_patch)
             c_um = self._corner_chamfer_3pt_um(q_slice, r_patch)
-            hit_records.append(_HitRecord(
-                geom_dist_vox=float(d_vox),
-                corner_chamfer_3pt_um=float(c_um),
-            ))
+            hit_records.append(_HitRecord(geom_dist_vox=float(d_vox), corner_chamfer_3pt_um=float(c_um)))
 
         gt_tau, gt_logits, gt_probs = self._build_soft_targets(hit_records)
         return hits, qimg, query_latency, hit_records, gt_tau, gt_logits, gt_probs
-
-    # -----------------------------------------------------------------
-    # Geometry distance
-    # -----------------------------------------------------------------
 
     def _um_per_vox(self) -> float:
         v = self.cfg.corner_um_per_vox
@@ -600,15 +552,7 @@ class Evaluator:
 
         return chamfer_vox * self._um_per_vox()
 
-    def _geom_distance_for_hit(self, *, q_slice: Slice, hit: SearchResult) -> float:
-        r_plane = self._get_retrieved_plane_slice(hit)
-        if r_plane is None:
-            return float("nan")
-
-        r_patch = self._crop_plane_to_patch(r_plane, hit)
-        if r_patch is None:
-            return float("nan")
-
+    def _geom_distance_for_patch(self, *, q_slice: Slice, r_patch: Slice) -> float:
         try:
             return float(Slice.distance(
                 q_slice,
@@ -623,7 +567,6 @@ class Evaluator:
     def _get_retrieved_plane_slice(self, hit: SearchResult) -> Optional[Slice]:
         m = hit.meta or {}
 
-        key: Optional[Tuple[int, int, int]]
         try:
             key = (int(m["normal_idx"]), int(m["depth_idx"]), int(m["rot_idx"]))
         except Exception:
@@ -661,6 +604,34 @@ class Evaluator:
         except Exception:
             return None
 
+    def _get_retrieved_patch_slice(self, hit: SearchResult) -> Optional[Slice]:
+        try:
+            pid = int(getattr(hit, "patch_id"))
+        except Exception:
+            pid = None
+
+        if pid is not None:
+            cached = self._retrieved_patch_cache.get(pid)
+            if cached is not None:
+                self._retrieved_patch_cache.move_to_end(pid)
+                return cached
+
+        plane = self._get_retrieved_plane_slice(hit)
+        if plane is None:
+            return None
+
+        patch = self._crop_plane_to_patch(plane, hit)
+        if patch is None:
+            return None
+
+        if pid is not None:
+            self._retrieved_patch_cache[pid] = patch
+            self._retrieved_patch_cache.move_to_end(pid)
+            while len(self._retrieved_patch_cache) > self._max_patch_cache:
+                self._retrieved_patch_cache.popitem(last=False)
+
+        return patch
+
     @staticmethod
     def _crop_plane_to_patch(plane: Slice, hit: SearchResult) -> Optional[Slice]:
         m = hit.meta or {}
@@ -696,10 +667,6 @@ class Evaluator:
         except Exception:
             return None
 
-    # -----------------------------------------------------------------
-    # Listwise target distribution
-    # -----------------------------------------------------------------
-
     def _build_soft_targets(self, hit_records: List[_HitRecord]) -> Tuple[float, np.ndarray, np.ndarray]:
         K = len(hit_records)
         if K == 0:
@@ -733,10 +700,6 @@ class Evaluator:
 
         return tau, logits, probs
 
-    # -----------------------------------------------------------------
-    # CSV recording
-    # -----------------------------------------------------------------
-
     def _write_hit_records(
         self,
         *,
@@ -756,7 +719,6 @@ class Evaluator:
 
         is_crop = bool(getattr(row, "is_crop", False))
         crop_area_frac = self._crop_area_frac(row)
-
         order_by = "rerank_score" if bool(self.cfg.use_reranker) else "score"
 
         for rank, (h, hr) in enumerate(zip(hits, hit_records), start=1):
@@ -770,19 +732,22 @@ class Evaluator:
 
             rec = {
                 "eval_sig": self.eval_sig,
-
                 "row_idx": idx,
                 "source": src_name,
                 "rank": rank,
                 "patch_id": h.patch_id,
                 "patch_path": self._get_patch_path_from_hit(h),
-
                 "score": float(h.score),
                 "rerank_score": float(rerank_score_val) if rerank_score_val is not None else None,
                 "order_by": order_by,
                 "primary_score": primary_score,
                 "query_angle_deg": float(h.angle),
-
+                "search_mode": str(self.cfg.search_mode_label),
+                "local_search_mode": str(self.cfg.local_search_mode),
+                "query_flip_x": bool(getattr(h, "flip_x", False)),
+                "query_flip_y": bool(getattr(h, "flip_y", False)),
+                "query_branch": str(getattr(h, "query_branch", "global")),
+                "query_crop_id": int(getattr(h, "query_crop_id", -1)),
                 "q_normal_x": float(qnx),
                 "q_normal_y": float(qny),
                 "q_normal_z": float(qnz),
@@ -790,7 +755,6 @@ class Evaluator:
                 "q_rot_deg": float(q_rot),
                 "q_is_crop": bool(is_crop),
                 "q_crop_area_frac": float(crop_area_frac),
-
                 "normal_idx": m.get("normal_idx"),
                 "depth_idx": m.get("depth_idx"),
                 "rot_idx": m.get("rot_idx"),
@@ -808,20 +772,13 @@ class Evaluator:
                 "y1": m.get("y1"),
                 "patch_h": m.get("patch_h"),
                 "patch_w": m.get("patch_w"),
-
                 "corner_chamfer_3pt_um": float(hr.corner_chamfer_3pt_um),
                 "geom_dist_vox": float(hr.geom_dist_vox),
-
                 "gt_tau_vox": float(gt_tau),
                 "gt_logit": float(gt_logits[rank - 1]) if (rank - 1) < int(gt_logits.size) else float("nan"),
                 "gt_prob": float(gt_probs[rank - 1]) if (rank - 1) < int(gt_probs.size) else float("nan"),
             }
-
             self._csv.write(rec)
-
-    # -----------------------------------------------------------------
-    # Planning / sources
-    # -----------------------------------------------------------------
 
     def _compute_rows_to_process(self) -> int:
         total = len(self.dl)
@@ -848,10 +805,6 @@ class Evaluator:
             out.append(("real", real_sl))
         return out
 
-    # -----------------------------------------------------------------
-    # Query/search helpers
-    # -----------------------------------------------------------------
-
     @staticmethod
     def _prep_img_from_slice(sl: Slice) -> np.ndarray:
         img = sl.image
@@ -862,10 +815,6 @@ class Evaluator:
     def _query(self, *, img_np: np.ndarray) -> Tuple[List[SearchResult], np.ndarray]:
         hits, qimg = self.searcher.search_image(img_np=img_np, k=self.cfg.final_k)
         return hits or [], qimg
-
-    # -----------------------------------------------------------------
-    # Summary / misc
-    # -----------------------------------------------------------------
 
     def _print_summary(self) -> None:
         s = self.stats
@@ -879,13 +828,13 @@ class Evaluator:
             print(f"Avg geom dist @1   : {s.avg_geom_dist:.2f} vox (Slice.distance, physical=False)")
         if s.rows_with_corner:
             print(f"Avg corner@1       : {s.avg_corner_um:.1f} um (3pt corner chamfer)")
+        print(f"Search mode        : {self.cfg.search_mode_label} (local_search_mode={self.cfg.local_search_mode})")
 
     @staticmethod
     def _get_patch_path_from_hit(h: SearchResult) -> str:
         p = getattr(h, "path", None)
         if p:
             return str(p)
-
         m = getattr(h, "meta", {}) or {}
         for k in ("patch_path", "img_path", "path", "rel_path", "png_path"):
             v = m.get(k)

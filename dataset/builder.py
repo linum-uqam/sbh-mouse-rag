@@ -1,10 +1,10 @@
-# dataset/builder.py
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, List
 
 import random
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
@@ -14,10 +14,6 @@ from volume.volume_helper import AllenVolume, NiftiVolume, Slice
 from .schema import DatasetRow, DatasetSchema, Vec3
 from .config import DatasetConfig
 
-
-# ============================================================
-# Helper classes
-# ============================================================
 
 @dataclass
 class DatasetStats:
@@ -73,53 +69,67 @@ class PlaneSampler:
 class CropSampler:
     """
     Crop bins are fixed at 3 (large/medium/small) + full slice is handled separately.
+
+    Aspect ratio is controlled explicitly through (aspect_w, aspect_h):
+      - (1, 1) -> square
+      - (2, 1) -> wide rectangle
+      - (1, 2) -> tall rectangle
+
+    The sampled size parameter corresponds to an approximate square-equivalent side
+    (geometric mean size). This keeps crop size bins comparable across aspect ratios.
     """
     min_frac: float
     max_frac: float
-    jitter: float = 0.15  # +/- around bin center
+    jitter: float = 0.15
 
     def __post_init__(self) -> None:
         min_f = float(self.min_frac)
         max_f = float(self.max_frac)
         if not (0.0 < min_f <= max_f <= 1.0):
             raise ValueError("min_frac/max_frac must be in (0,1] and min_frac <= max_frac")
-
-        # 3 crop bins => 4 edges
         self._edges = np.linspace(min_f, max_f, num=4).astype(np.float64)
 
-    def sample_crop_params_for_bin(self, bin_idx: int) -> Tuple[float, float, float, float]:
-        """
-        bin_idx:
-          0 -> large
-          1 -> medium
-          2 -> small
-
-        We map indices so that "0 is large" (intuitive with crop0 naming).
-        Internally edges go min->max, so we invert.
-        """
+    def _sample_size_for_bin(self, bin_idx: int) -> float:
         if bin_idx not in (0, 1, 2):
             raise ValueError("bin_idx must be 0 (large), 1 (medium), or 2 (small)")
 
-        # Invert so 0=large uses the largest interval, 2=small uses smallest.
         inv = 2 - bin_idx
         low = float(self._edges[inv])
         high = float(self._edges[inv + 1])
         center = 0.5 * (low + high)
 
-        def sample_size() -> float:
-            # jitter center but clamp to [low, high]
-            j_low = max(low, center * (1.0 - self.jitter))
-            j_high = min(high, center * (1.0 + self.jitter))
-            if j_high <= j_low:
-                return center
-            return random.uniform(j_low, j_high)
+        j_low = max(low, center * (1.0 - self.jitter))
+        j_high = min(high, center * (1.0 + self.jitter))
+        if j_high <= j_low:
+            return center
+        return random.uniform(j_low, j_high)
 
-        rw = float(sample_size())
-        rh = float(sample_size())
+    def sample_crop_params_for_bin_and_aspect(
+        self,
+        bin_idx: int,
+        *,
+        aspect_w: float,
+        aspect_h: float,
+    ) -> Tuple[float, float, float, float]:
+        if aspect_w <= 0 or aspect_h <= 0:
+            raise ValueError("aspect_w and aspect_h must be > 0")
+
+        area_side = float(self._sample_size_for_bin(bin_idx))
+        ratio = float(aspect_w) / float(aspect_h)
+        ratio_sqrt = math.sqrt(ratio)
+
+        rw = area_side * ratio_sqrt
+        rh = area_side / ratio_sqrt
+
+        max_side = max(rw, rh)
+        if max_side > 1.0:
+            scale = 1.0 / max_side
+            rw *= scale
+            rh *= scale
 
         cx = random.uniform(0.0, 1.0)
         cy = random.uniform(0.0, 1.0)
-        return cx, cy, rw, rh
+        return cx, cy, float(rw), float(rh)
 
 
 @dataclass
@@ -139,25 +149,17 @@ class VolumePair:
         return a, r
 
 
-# ============================================================
-# Main builder
-# ============================================================
-
 class MouseBrainDatasetBuilder:
     """
-    Fixed 4 bins:
-      - full slice
-      - large crop
-      - medium crop
-      - small crop
+    Per plane we generate:
+      - 1 full slice
+      - 3 crop bins (large/medium/small)
+      - for each configured aspect-ratio family
 
-    If cfg.num_slices = N, we generate:
-      - N full slices
-      - N large crops
-      - N medium crops
-      - N small crops
-    Total rows = 4N (and images likewise, if save_images=True).
+    Total rows = num_slices * (1 + 3 * len(cfg.crop_aspect_ratios))
     """
+
+    CROP_BIN_LABELS = {0: "large", 1: "medium", 2: "small"}
 
     def __init__(self, cfg: DatasetConfig) -> None:
         self.cfg = cfg
@@ -176,37 +178,47 @@ class MouseBrainDatasetBuilder:
 
         self._vol_shape_zyx = self.volumes.allen.get_dimension()
         self.plane_sampler = PlaneSampler(self._vol_shape_zyx)
-
         self.crop_sampler = CropSampler(
             min_frac=self.cfg.min_crop_frac,
             max_frac=self.cfg.max_crop_frac,
         )
-
         self.stats = DatasetStats()
 
     @staticmethod
     def _save_img(path: Path, arr: np.ndarray) -> None:
         plt.imsave(path, arr, cmap="gray")
 
+    def _iter_crop_aspects(self) -> List[tuple[str, tuple[float, float]]]:
+        labels = tuple(self.cfg.crop_aspect_labels)
+        ratios = tuple(self.cfg.crop_aspect_ratios)
+        if len(labels) != len(ratios):
+            raise ValueError("crop_aspect_labels and crop_aspect_ratios must have the same length")
+        out: List[tuple[str, tuple[float, float]]] = []
+        for label, ratio in zip(labels, ratios):
+            if len(ratio) != 2:
+                raise ValueError(f"Each crop aspect ratio must be a pair (w, h), got: {ratio!r}")
+            aw = float(ratio[0])
+            ah = float(ratio[1])
+            if aw <= 0 or ah <= 0:
+                raise ValueError(f"Crop aspect values must be > 0, got: {ratio!r}")
+            out.append((str(label), (aw, ah)))
+        return out
+
     def run(self) -> None:
         DatasetSchema.init_csv(self.cfg.csv_path)
 
         N = int(self.cfg.num_slices)
-        total_rows = 4 * N
-
-        # Store plane parameters per contiguous plane_id
+        aspect_specs = self._iter_crop_aspects()
+        total_rows = N * (1 + 3 * len(aspect_specs))
         planes: List[Tuple[Vec3, float, float]] = []
 
         pbar = tqdm(
             total=total_rows,
-            desc="Generating dataset (full + 3 crop bins)",
+            desc="Generating dataset (full + multi-aspect crops)",
             dynamic_ncols=True,
             leave=True,
         )
 
-        # ----------------------------
-        # Phase A: N valid full slices
-        # ----------------------------
         for plane_id in range(N):
             while True:
                 n_vec, depth, rotation = self.plane_sampler.sample_plane()
@@ -216,28 +228,18 @@ class MouseBrainDatasetBuilder:
                     rotation=rotation,
                     size=self.cfg.slice_size,
                 )
-
                 if self.volumes.allen.is_valid_slice(a_slice):
-                    # accept
                     planes.append((n_vec, float(depth), float(rotation)))
                     self._write_full(plane_id, a_slice, r_slice, n_vec, depth, rotation)
                     self.stats.full_written += 1
                     pbar.update(1)
                     pbar.set_postfix(self.stats.postfix())
                     break
-
                 self.stats.planes_resampled += 1
                 pbar.set_postfix(self.stats.postfix())
 
-        # -------------------------------------------
-        # Phase B: for each plane, 3 crops (L/M/S)
-        # crop_idx is stable:
-        #   0 = large, 1 = medium, 2 = small
-        # -------------------------------------------
         for plane_id in range(N):
             n_vec, depth, rotation = planes[plane_id]
-
-            # regenerate base slices (no need to keep all in RAM)
             a_slice, r_slice = self.volumes.sample_pair(
                 normal=n_vec,
                 depth=depth,
@@ -246,24 +248,24 @@ class MouseBrainDatasetBuilder:
             )
 
             for crop_idx in (0, 1, 2):
-                self._write_one_crop_for_plane(
-                    plane_id=plane_id,
-                    crop_idx=crop_idx,
-                    a_slice=a_slice,
-                    r_slice=r_slice,
-                    n_vec=n_vec,
-                    depth=depth,
-                    rotation=rotation,
-                )
-                self.stats.crops_written += 1
-                pbar.update(1)
-                pbar.set_postfix(self.stats.postfix())
+                for crop_kind, (aspect_w, aspect_h) in aspect_specs:
+                    self._write_one_crop_for_plane(
+                        plane_id=plane_id,
+                        crop_idx=crop_idx,
+                        crop_kind=crop_kind,
+                        aspect_w=aspect_w,
+                        aspect_h=aspect_h,
+                        a_slice=a_slice,
+                        r_slice=r_slice,
+                        n_vec=n_vec,
+                        depth=depth,
+                        rotation=rotation,
+                    )
+                    self.stats.crops_written += 1
+                    pbar.update(1)
+                    pbar.set_postfix(self.stats.postfix())
 
         pbar.close()
-
-    # ----------------------------
-    # Writers
-    # ----------------------------
 
     def _write_full(
         self,
@@ -292,31 +294,39 @@ class MouseBrainDatasetBuilder:
             crop_rw=1.0,
             crop_rh=1.0,
             is_crop=0,
+            crop_bin="full",
+            crop_kind="full",
+            crop_aspect_w=1.0,
+            crop_aspect_h=1.0,
         )
         DatasetSchema.append_row(self.cfg.csv_path, row)
 
     def _write_one_crop_for_plane(
         self,
         plane_id: int,
-        crop_idx: int,  # 0=large, 1=medium, 2=small
+        crop_idx: int,
+        crop_kind: str,
+        aspect_w: float,
+        aspect_h: float,
         a_slice: Slice,
         r_slice: Slice,
         n_vec: Vec3,
         depth: float,
         rotation: float,
     ) -> None:
-        """
-        Keep trying until we get a valid crop for the requested bin.
-        Uses cfg.max_crop_attempts as the attempt cap *per bin per plane*.
-        """
         max_attempts = int(self.cfg.max_crop_attempts)
         if max_attempts <= 0:
             raise ValueError("max_crop_attempts must be > 0 to generate fixed crop quotas")
 
+        crop_bin_label = self.CROP_BIN_LABELS[int(crop_idx)]
+
         for _ in range(max_attempts):
             self.stats.crop_attempts += 1
-
-            cx, cy, rw, rh = self.crop_sampler.sample_crop_params_for_bin(crop_idx)
+            cx, cy, rw, rh = self.crop_sampler.sample_crop_params_for_bin_and_aspect(
+                crop_idx,
+                aspect_w=float(aspect_w),
+                aspect_h=float(aspect_h),
+            )
 
             a_crop = a_slice.crop_norm(cx=cx, cy=cy, rw=rw, rh=rh, clamp=True)
             r_crop = r_slice.crop_norm(cx=cx, cy=cy, rw=rw, rh=rh, clamp=True)
@@ -324,8 +334,9 @@ class MouseBrainDatasetBuilder:
             if not self.volumes.allen.is_valid_slice(a_crop):
                 continue
 
-            allen_path = self.cfg.out_dir / f"{plane_id:05d}_a_crop{crop_idx}.png"
-            real_path = self.cfg.out_dir / f"{plane_id:05d}_r_crop{crop_idx}.png"
+            suffix = f"crop{crop_idx}_{crop_kind}"
+            allen_path = self.cfg.out_dir / f"{plane_id:05d}_a_{suffix}.png"
+            real_path = self.cfg.out_dir / f"{plane_id:05d}_r_{suffix}.png"
 
             if self.cfg.save_images:
                 self._save_img(allen_path, a_crop.image)
@@ -342,14 +353,17 @@ class MouseBrainDatasetBuilder:
                 crop_rw=float(rw),
                 crop_rh=float(rh),
                 is_crop=1,
+                crop_bin=crop_bin_label,
+                crop_kind=str(crop_kind),
+                crop_aspect_w=float(aspect_w),
+                crop_aspect_h=float(aspect_h),
             )
             DatasetSchema.append_row(self.cfg.csv_path, row)
             return
 
-        # If we get here, we failed to find a valid crop within the cap.
         self.stats.crop_failures += 1
         raise RuntimeError(
-            f"Failed to generate a valid crop for plane_id={plane_id}, crop_idx={crop_idx} "
-            f"within max_crop_attempts={max_attempts}. "
+            f"Failed to generate a valid crop for plane_id={plane_id}, crop_idx={crop_idx}, "
+            f"crop_kind={crop_kind} within max_crop_attempts={max_attempts}. "
             "Consider increasing --max-crop-attempts or relaxing --min-crop-frac/--max-crop-frac."
         )
