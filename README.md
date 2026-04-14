@@ -76,17 +76,17 @@ python -m scripts.run_eval \
 **Run the report script**
 ```bash
 # compare search modes 
-python eval/report.py \
-  --csv out/eval/eval_modes/fast --label fast \
-  --csv out/eval/eval_modes/smart --label smart \
-  --csv out/eval/eval_modes/enhanced --label enhanced \
+python -m scripts.run_report \
+  --csv out/eval/eval_modes_reranker/fast --label fast \
+  --csv out/eval/eval_modes_reranker/smart --label smart \
+  --csv out/eval/eval_modes_reranker/enhanced --label enhanced \
   --baseline fast \
-  --save out/eval_compare/compare_modes.csv
+  --save out/eval_modes_reranker/compare_modes.csv
 
 # Reranker vs base search
 python -m scripts.run_report \
-  --baseline out/eval/eval_modes/fast \
-  --rerank out/eval/eval_modes_rerank/fast
+  --baseline out/eval/eval_modes_base/fast \
+  --rerank out/eval/eval_modes_reranker/fast
 ```
 
 
@@ -126,6 +126,29 @@ python -m scripts.train_reranker \
   --list-k 100 \
   --epochs 100 \
   --batch-size 64
+
+python -m scripts.train_reranker \
+  --hits-csv out/reranker_dataset/eval_hits.csv \
+  --dataset-csv out/reranker_dataset/dataset.csv \
+  --patch-vectors out/index/patch_vectors.npy \
+  --patch-manifest out/index/patch_manifest.parquet \
+  --query-cache out/reranker/query_vectors.npy \
+  --out out/reranker/reranker_listwise_phase_a.pt \
+  --train-topk 100 \
+  --list-k 64 \
+  --sampling-mode stratified \
+  --sample-top-n 16 \
+  --sample-mid-n 24 \
+  --sample-tail-n 24 \
+  --distance-loss-weight 0.25 \
+  --distance-loss-type huber \
+  --distance-target log1p \
+  --epochs 50 \
+  --early-stopping-patience 6 \
+  --early-stopping-min-delta 0.001 \
+  --plateau-patience 2 \
+  --plateau-factor 0.5 \
+  --plateau-min-lr 1e-6
 ```
 
 **Search with the reranker**
@@ -146,18 +169,17 @@ python -m scripts.search_index \
 ```bash
 # With reranker
 python -m scripts.run_eval \
-  --search-mode all
+  --search-mode all \
   --csv out/dataset/dataset.csv \
   --source both \
   --final-k 100 \
   --k-per-angle 64 \
   --save-dir out/eval/rerank \
-  --save-k 3 \
   --distance-grid 32 \
   --distance-trim 0.05 \
   --use-reranker \
   --rerank-topk 100 \
-  --reranker-model-path out/reranker/reranker_listwise.pt \
+  --reranker-model-path out/reranker/reranker_listwise_phase_a.pt \
   --reranker-device cuda \
   --reranker-batch-size 256
 ```
