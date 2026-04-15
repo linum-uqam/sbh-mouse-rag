@@ -38,6 +38,10 @@ class SearchConfig:
     min_fg_ratio: float = 0.05
     verbose: bool = True
 
+    # Optional restriction on indexed patch scales.
+    # None = search across all scales.
+    allowed_scales: Tuple[int, ...] | None = None
+
     # --- local crop search (v2 auto / v3 force) ---
     local_search_mode: LocalSearchMode = "auto"   # off | auto | force
     local_k_per_view: int | None = None            # defaults to k_per_angle
@@ -139,6 +143,13 @@ class SliceSearcher:
             int(row["rot_idx"]),
         )
 
+    def _normalized_allowed_scales(self) -> set[int] | None:
+        vals = self.cfg.allowed_scales
+        if vals is None:
+            return None
+        out = {int(v) for v in vals}
+        return out if out else None
+
     def search_image(self, img_np: np.ndarray, k: int = 10) -> Tuple[List[SearchResult], np.ndarray]:
         """
         Search using a query image and return:
@@ -160,13 +171,95 @@ class SliceSearcher:
         if G.ndim != 2:
             raise ValueError(f"Expected embeddings (A,D), got {G.shape}")
 
-        # 4) single FAISS call for all query views at once
         per_view_k = [int(v.get("k", self.cfg.k_per_angle)) for v in query_views]
-        k_search = int(max(per_view_k)) if per_view_k else int(self.cfg.k_per_angle)
-        D_all, I_all = self.store.search(G, k_search)  # each (A, k_search)
+        base_k_search = int(max(per_view_k)) if per_view_k else int(self.cfg.k_per_angle)
 
-        # 5) aggregate evidence per patch_id across global/local views
+        allowed_scales = self._normalized_allowed_scales()
+
+        current_k = min(max(base_k_search, int(k)), int(self.store.size))
+        if allowed_scales is not None:
+            current_k = min(max(current_k, int(k) * 4), int(self.store.size))
+
+        final_results: List[SearchResult] = []
+        final_best_slice_count = 0
+        final_total_candidates = 0
+
+        while True:
+            D_all, I_all = self.store.search(G, current_k)
+            results, best_slice_count, total_candidates = self._collect_results_from_search(
+                G=G,
+                angles=angles,
+                query_views=query_views,
+                D_all=D_all,
+                I_all=I_all,
+                k=k,
+                allowed_scales=allowed_scales,
+            )
+
+            final_results = results
+            final_best_slice_count = best_slice_count
+            final_total_candidates = total_candidates
+
+            enough = len(results) >= int(k)
+            exhausted = current_k >= int(self.store.size)
+            no_filter = allowed_scales is None
+
+            if no_filter or enough or exhausted:
+                break
+
+            next_k = min(int(self.store.size), int(current_k * 2))
+            if next_k <= current_k:
+                break
+            current_k = next_k
+
+        if self.cfg.verbose:
+            n_global = sum(1 for v in query_views if v["branch"] == "global")
+            n_local = sum(1 for v in query_views if v["branch"] == "local")
+            log("search", [
+                f"Angles                        : {len(angles)}",
+                f"flip_x                        : {bool(self.cfg.flip_x)}",
+                f"flip_y                        : {bool(self.cfg.flip_y)}",
+                f"Allowed scales                : {sorted(allowed_scales) if allowed_scales is not None else 'all'}",
+                f"Global query variants         : {n_global}",
+                f"Local query variants          : {n_local}",
+                f"Total query variants          : {len(query_views)}",
+                f"FAISS k_search                : {current_k}",
+                f"Candidates before patch dedup : {final_total_candidates}",
+                f"Unique indexed slices         : {final_best_slice_count}",
+                f"Returned results              : {len(final_results)}",
+            ])
+
+        # 9) Optional reranking
+        if self.cfg.use_reranker and self.reranker is not None and final_results:
+            self._apply_reranker(final_results, G)
+
+        return final_results, q
+
+    def _collect_results_from_search(
+        self,
+        *,
+        G: np.ndarray,
+        angles: Tuple[float, ...],
+        query_views: List[Dict[str, Any]],
+        D_all: np.ndarray,
+        I_all: np.ndarray,
+        k: int,
+        allowed_scales: set[int] | None,
+    ) -> Tuple[List[SearchResult], int, int]:
+        """
+        Convert raw FAISS outputs into final SearchResult objects, with optional
+        scale filtering applied at manifest-row time.
+
+        Returns:
+          - results
+          - number of unique indexed slices after filtering/dedup
+          - total candidate count examined before patch dedup
+        """
+        k_search = I_all.shape[1] if I_all.ndim == 2 else int(self.cfg.k_per_angle)
+
+        # 1) aggregate evidence per patch_id across global/local views
         best_patch: Dict[int, Dict[str, Any]] = {}
+        total_candidates = 0
 
         for aug_idx, view in enumerate(query_views):
             angle = float(view["angle"])
@@ -174,10 +267,11 @@ class SliceSearcher:
             flip_y = bool(view["flip_y"])
             branch = str(view["branch"])
             crop_id = int(view.get("crop_id", -1))
-            k_view = int(view.get("k", k_search))
+            k_view = min(int(view.get("k", k_search)), k_search)
 
             d_row = D_all[aug_idx][:k_view]
             i_row = I_all[aug_idx][:k_view]
+            total_candidates += len(i_row)
 
             for score, pid in zip(d_row, i_row):
                 pid = int(pid)
@@ -225,9 +319,9 @@ class SliceSearcher:
                         rec["local_crop_id"] = crop_id
 
         if not best_patch:
-            return [], q
+            return [], 0, total_candidates
 
-        # 6) collapse global/local evidence into a single coarse score per patch
+        # 2) collapse global/local evidence into a single coarse score per patch
         fused_patch: Dict[int, Tuple[float, float, bool, bool, int, str, int]] = {}
         # patch_id -> (score, angle, flip_x, flip_y, aug_idx, branch, crop_id)
         for pid, rec in best_patch.items():
@@ -268,9 +362,9 @@ class SliceSearcher:
                 )
 
         if not fused_patch:
-            return [], q
+            return [], 0, total_candidates
 
-        # 7) dedup by indexed source slice/image
+        # 3) dedup by indexed source slice/image, with optional scale filtering
         candidate_ids = list(fused_patch.keys())
         df_rows = self.store.rows_for_ids(candidate_ids)
 
@@ -281,6 +375,11 @@ class SliceSearcher:
             row = df_rows.loc[int(pid)]
             if row.isnull().all():
                 continue
+
+            if allowed_scales is not None:
+                row_scale = row.get("scale", None)
+                if row_scale is None or int(row_scale) not in allowed_scales:
+                    continue
 
             slice_key = self._slice_key_from_row(row)
             score, angle, flip_x, flip_y, aug_idx, branch, crop_id = fused_patch[int(pid)]
@@ -299,24 +398,10 @@ class SliceSearcher:
                 )
 
         if not best_slice:
-            return [], q
+            return [], 0, total_candidates
+        
 
-        if self.cfg.verbose:
-            n_global = sum(1 for v in query_views if v["branch"] == "global")
-            n_local = sum(1 for v in query_views if v["branch"] == "local")
-            log("search", [
-                f"Angles                        : {len(angles)}",
-                f"flip_x                        : {bool(self.cfg.flip_x)}",
-                f"flip_y                        : {bool(self.cfg.flip_y)}",
-                f"Global query variants         : {n_global}",
-                f"Local query variants          : {n_local}",
-                f"Total query variants          : {len(query_views)}",
-                f"Candidates before patch dedup : {sum(len(I_all[a][:int(query_views[a].get('k', k_search))]) for a in range(len(query_views)))}",
-                f"Unique patch ids              : {len(fused_patch)}",
-                f"Unique indexed slices         : {len(best_slice)}",
-            ])
-
-        # 8) sort unique slices by score desc and keep top-k
+        # 4) sort unique slices by score desc and keep top-k
         sorted_hits = sorted(best_slice.values(), key=lambda t: t[1], reverse=True)
         top = sorted_hits[: int(k)]
 
@@ -340,11 +425,7 @@ class SliceSearcher:
                 )
             )
 
-        # 9) Optional reranking
-        if self.cfg.use_reranker and self.reranker is not None and results:
-            self._apply_reranker(results, G)
-
-        return results, q
+        return results, len(best_slice), total_candidates
 
     def to_dataframe(self, hits: List[SearchResult]) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = []

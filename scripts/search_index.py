@@ -46,6 +46,18 @@ def parse_args() -> argparse.Namespace:
         help="Number of neighbours to fetch per local crop variant. Default: same as --k-per-angle.",
     )
 
+    parser.add_argument(
+        "--scales",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional indexed patch scales to search in. "
+            "Examples: --scales 1 (whole slice only), --scales 2, --scales 4, "
+            "--scales 1 2. Default: all scales."
+        ),
+    )
+
     # Default = enabled
     parser.add_argument(
         "--no-flip-x",
@@ -169,6 +181,7 @@ def main() -> None:
     flip_x = not args.no_flip_x
     flip_y = not args.no_flip_y
     global_variant_count = len(args.angles) * (2 if flip_x else 1) * (2 if flip_y else 1)
+    allowed_scales = None if args.scales is None else tuple(sorted({int(s) for s in args.scales}))
 
     log("search", [
         "Starting search...",
@@ -177,6 +190,7 @@ def main() -> None:
         f"Angles (deg)               : {args.angles}",
         f"k_per_angle                : {args.k_per_angle}",
         f"local_k_per_view           : {args.local_k_per_view}",
+        f"Allowed scales             : {'all' if allowed_scales is None else allowed_scales}",
         f"flip_x                     : {flip_x}",
         f"flip_y                     : {flip_y}",
         f"Global query variants      : {global_variant_count}",
@@ -201,6 +215,7 @@ def main() -> None:
 
     cfg = SearchConfig(
         angles=tuple(float(a) for a in args.angles),
+        allowed_scales=allowed_scales,
         flip_x=flip_x,
         flip_y=flip_y,
         pad_to_square=not args.no_pad_to_square,

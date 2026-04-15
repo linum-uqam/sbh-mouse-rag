@@ -25,7 +25,7 @@ python -m scripts.create_index --save-patch-images --patch-image-dirname patch_p
 ```bash
 # Base search (only faiss cosine similarity)
 python -m scripts.search_index \
-  out/dataset/data/00005_a_crop1.png \
+  out/dataset/data/00005_a.png \
   --local-search-mode auto \
   --k 20 \
   --angles 0 45 90 135 180 225 270 315 \
@@ -34,7 +34,7 @@ python -m scripts.search_index \
 
 # With re-ranker (using MLP on embeddings as reranker)
 python -m scripts.search_index \
-  out/dataset/data/00005_a_crop1.png \
+  out/dataset/data/00005_a.png \
   --local-search-mode force \
   --force-max-local-crops 8 \
   --force-square-scales 2 \
@@ -43,7 +43,7 @@ python -m scripts.search_index \
   --k-per-angle 64 \
   --save-dir out/search/reranked \
   --use-reranker \
-  --reranker-model out/reranker/reranker_listwise.pt \
+  --reranker-model out/reranker/reranker_listwise_phase_a.pt \
   --rerank-topk 100
 ```
 
