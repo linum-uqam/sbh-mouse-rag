@@ -6,7 +6,7 @@ OUT_DIR = Path("out/index/")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Geometry / sampling ---
-K_NORMALS = 16          # Fibonacci normals
+K_NORMALS = 64          # Fibonacci normals
 SLICE_SIZE = 512        # square slice size in pixels
 
 # Sliding-window patch scales (number of base tiles per side)

@@ -268,7 +268,56 @@ def load_eval_csv(path: str | Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def print_metrics_table(df: pd.DataFrame, title: str) -> None:
+
+
+# ----------------------------
+# Report display helpers
+# ----------------------------
+
+def _metric_prefers_lower(metric_name: str) -> bool:
+    return metric_name.startswith("Geom@") or metric_name.startswith("RankBestGeom")
+
+def _decorate_best_values(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a display-only copy where the best numeric run values in each row are suffixed with a star.
+    Delta columns are left undecorated.
+    """
+    out = df.copy().astype(object)
+
+    run_cols = [c for c in df.columns if not str(c).startswith("delta")]
+    for idx in df.index:
+        metric = str(idx[2]) if isinstance(idx, tuple) and len(idx) >= 3 else ""
+        vals = pd.to_numeric(df.loc[idx, run_cols], errors="coerce")
+        finite = vals[np.isfinite(vals.to_numpy(dtype=float))]
+        # format all run columns as strings first
+        for c in run_cols:
+            v = df.loc[idx, c]
+            out.at[idx, c] = "" if pd.isna(v) else f"{float(v):.4f}"
+        # format delta columns too
+        for c in [c for c in df.columns if str(c).startswith("delta")]:
+            v = df.loc[idx, c]
+            out.at[idx, c] = "" if pd.isna(v) else f"{float(v):+.4f}"
+        if finite.empty:
+            continue
+        best = float(finite.min() if _metric_prefers_lower(metric) else finite.max())
+        for c in run_cols:
+            v = pd.to_numeric(pd.Series([df.loc[idx, c]]), errors="coerce").iloc[0]
+            if pd.isna(v):
+                continue
+            if np.isclose(float(v), best, rtol=1e-12, atol=1e-12):
+                out.at[idx, c] = f"{float(v):.4f} ★"
+    return out
+
+def print_metric_legend() -> None:
+    print("\nMetric guide:")
+    print("  - Geom@K_mean / Geom@K_median: best geometric distance found within the top-K. Lower is better.")
+    print("  - RankBestGeom_mean / RankBestGeom_median: rank position of the geometrically best candidate. Lower is better.")
+    print("  - SR@K(thr=T): success rate; fraction of queries with at least one candidate within distance threshold T in top-K. Higher is better.")
+    print("  - MRR_geom(thr=T): reciprocal rank of the first candidate within threshold T. Higher is better.")
+    print("  - NDCG@K_mean / NDCG@K_median: ranking quality over the top-K using geometry-derived relevance. Higher is better.")
+    print("  - ★ marks the best run value in that row.")
+
+def print_metrics_table(df: pd.DataFrame, title: str, *, decorate_best: bool = False) -> None:
     with pd.option_context(
         "display.max_rows", 1000,
         "display.max_columns", 100,
@@ -276,7 +325,8 @@ def print_metrics_table(df: pd.DataFrame, title: str) -> None:
         "display.float_format", lambda x: f"{x:10.4f}",
     ):
         print(f"\n=== {title} ===")
-        print(df)
+        display_df = _decorate_best_values(df) if decorate_best else df
+        print(display_df)
 
 
 def single_report(df: pd.DataFrame, ks: List[int]) -> pd.DataFrame:
@@ -285,7 +335,8 @@ def single_report(df: pd.DataFrame, ks: List[int]) -> pd.DataFrame:
 
     m = compute_metrics(df, ks=ks, thresholds=thr)
     p = _pivot(m, "value")
-    print_metrics_table(p, "Metrics")
+    print_metrics_table(p, "Metrics", decorate_best=True)
+    print_metric_legend()
     return p
 
 
@@ -301,7 +352,8 @@ def compare_reports(df_base: pd.DataFrame, df_rerank: pd.DataFrame, ks: List[int
 
     joined = p_base.join(p_rer, how="outer")
     joined["delta"] = joined["rerank"] - joined["baseline"]
-    print_metrics_table(joined, "Baseline vs Rerank (rerank - baseline)")
+    print_metrics_table(joined, "Baseline vs Rerank (rerank - baseline)", decorate_best=True)
+    print_metric_legend()
     return joined
 
 
@@ -327,7 +379,8 @@ def compare_named_reports(named_dfs: Dict[str, pd.DataFrame], ks: List[int]) -> 
     for name in list(named_dfs.keys())[1:]:
         joined[f"delta_vs_{baseline_col}__{name}"] = joined[name] - joined[baseline_col]
 
-    print_metrics_table(joined, f"Multi-run comparison (baseline={baseline_col})")
+    print_metrics_table(joined, f"Multi-run comparison (baseline={baseline_col})", decorate_best=True)
+    print_metric_legend()
     return joined
 
 
